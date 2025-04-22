@@ -1,0 +1,424 @@
+BASE:
+- ''
+DEVICE: cuda:0
+ENCODER:
+  DROP_RATE: 0.0
+  MODEL_DIR: PreTrainedModels
+  NAME: TemporalBranch
+  RESUME: ''
+INFERENCE:
+  BATCH_SIZE: 1
+  EVALUATION_METHOD: FFT
+  EVALUATION_WINDOW:
+    USE_SMALLER_WINDOW: false
+    WINDOW_SIZE: 10
+  MODEL_PATH: ''
+LOG:
+  PATH: /home/changmin/log
+MODEL:
+  BIGSMALL:
+    FRAME_DEPTH: 3
+  DROP_RATE: 0.0
+  EFFICIENTPHYS:
+    FRAME_DEPTH: 10
+  EMOTION:
+    CWFREQ_EMBED_DIM: 128
+    FUSION_DIM: 512
+    PRV_EMBED_DIM: 128
+    TEMPORAL_EMBED_DIM: 256
+  FactorizePhys:
+    CHANNELS: 3
+    FRAME_NUM: 160
+    MD_FSAM: false
+    MD_INFERENCE: true
+    MD_R: 1
+    MD_RESIDUAL: true
+    MD_S: 1
+    MD_STEPS: 4
+    MD_TRANSFORM: T_KAB
+    MD_TYPE: NMF
+    TYPE: Standard
+  MODEL_DIR: /home/changmin/log/MAHNOB-HCI_SizeW128_SizeH128_ClipLength128_DataTypeDiffNormalized_DataAugNone_LabelTypeDiffNormalized_Crop_faceTrue_BackendHC_Large_boxTrue_Large_size1.5_Dyamic_DetFalse_det_len30_Median_face_boxFalse/PreTrainedModels
+  NAME: ''
+  PHYSFORMER:
+    DIM: 96
+    FF_DIM: 144
+    NUM_HEADS: 4
+    NUM_LAYERS: 12
+    PATCH_SIZE: 4
+    THETA: 0.7
+  PHYSNET:
+    FRAME_NUM: 64
+  RESUME: ''
+  TSCAN:
+    FRAME_DEPTH: 10
+  iBVPNet:
+    CHANNELS: 3
+    FRAME_NUM: 160
+NUM_OF_GPU_TRAIN: 1
+RESULTS:
+  accuracy: 0.5849056603773585
+  best_epoch: 49
+  confusion_matrix: !!python/object/apply:numpy.core.multiarray._reconstruct
+    args:
+    - !!python/name:numpy.ndarray ''
+    - !!python/tuple
+      - 0
+    - !!binary |
+      Yg==
+    state: !!python/tuple
+    - 1
+    - !!python/tuple
+      - 2
+      - 2
+    - !!python/object/apply:numpy.dtype
+      args:
+      - i8
+      - false
+      - true
+      state: !!python/tuple
+      - 3
+      - <
+      - null
+      - null
+      - null
+      - -1
+      - -1
+      - 0
+    - false
+    - !!binary |
+      BgAAAAAAAAAWAAAAAAAAAAAAAAAAAAAAGQAAAAAAAAA=
+  f1_score: 0.6944444444444444
+  tag: best_metric
+  train_loss: 0.6983850289065883
+  valid_loss: 0.6963539753320083
+ReMOTION_MODE: train_and_test
+TEST:
+  BATCH_SIZE: 1
+  DATA:
+    BEGIN: 0.9
+    CACHED_PATH: /home/changmin/data/MAHNOB_HCI_Emotion_Preprocessed/MAHNOB-HCI_SizeW128_SizeH128_ClipLength128_DataTypeDiffNormalized_DataAugNone_LabelTypeDiffNormalized_Crop_faceTrue_BackendHC_Large_boxTrue_Large_size1.5_Dyamic_DetFalse_det_len30_Median_face_boxFalse
+    DATASET: MAHNOB-HCI
+    DATA_FORMAT: NDHWC
+    DATA_PATH: /home/changmin/data/MAHNOB_HCI_Emotion
+    DO_PREPROCESS: false
+    END: 1.0
+    EXP_DATA_NAME: MAHNOB-HCI_SizeW128_SizeH128_ClipLength128_DataTypeDiffNormalized_DataAugNone_LabelTypeDiffNormalized_Crop_faceTrue_BackendHC_Large_boxTrue_Large_size1.5_Dyamic_DetFalse_det_len30_Median_face_boxFalse
+    FILE_LIST_PATH: /home/changmin/data/MAHNOB_HCI_Emotion_Preprocessed/DataFileLists/MAHNOB-HCI_SizeW128_SizeH128_ClipLength128_DataTypeDiffNormalized_DataAugNone_LabelTypeDiffNormalized_Crop_faceTrue_BackendHC_Large_boxTrue_Large_size1.5_Dyamic_DetFalse_det_len30_Median_face_boxFalse_0.9_1.0.csv
+    FILTERING:
+      EXCLUSION_LIST:
+      - ''
+      SELECT_TASKS: false
+      TASK_LIST:
+      - ''
+      USE_EXCLUSION_LIST: false
+    FOLD:
+      FOLD_NAME: ''
+      FOLD_PATH: ''
+    FOLD_INDEX: 0
+    FS: 30
+    INFO:
+      EXERCISE:
+      - true
+      GENDER:
+      - ''
+      GLASSER:
+      - true
+      HAIR_COVER:
+      - true
+      LIGHT:
+      - ''
+      MAKEUP:
+      - true
+      MOTION:
+      - ''
+      SKIN_COLOR:
+      - 1
+    LABEL_COLUMN: BC_Arsl
+    LABEL_SOURCE: CSV
+    NUM_FOLDS: 5
+    PREPROCESS:
+      BIGSMALL:
+        BIG_DATA_TYPE:
+        - ''
+        RESIZE:
+          BIG_H: 144
+          BIG_W: 144
+          SMALL_H: 9
+          SMALL_W: 9
+        SMALL_DATA_TYPE:
+        - ''
+      CHUNK_LENGTH: 128
+      CROP_FACE:
+        BACKEND: HC
+        DETECTION:
+          DO_DYNAMIC_DETECTION: false
+          DYNAMIC_DETECTION_FREQUENCY: 30
+          USE_MEDIAN_FACE_BOX: false
+        DO_CROP_FACE: true
+        LARGE_BOX_COEF: 1.5
+        USE_LARGE_FACE_BOX: true
+      DATA_AUG:
+      - None
+      DATA_TYPE:
+      - DiffNormalized
+      DO_CHUNK: true
+      IBVP:
+        DATA_MODE: RGB
+      LABEL_TYPE: DiffNormalized
+      RESIZE:
+        H: 128
+        W: 128
+      USE_PSUEDO_PPG_LABEL: false
+    SPLIT_METHOD: ''
+    current_subject: null
+  METRICS:
+  - MAE
+  - RMSE
+  - MAPE
+  - Pearson
+  - SNR
+  - BA
+  OUTPUT_SAVE_DIR: /home/changmin/log/MAHNOB-HCI_SizeW128_SizeH128_ClipLength128_DataTypeDiffNormalized_DataAugNone_LabelTypeDiffNormalized_Crop_faceTrue_BackendHC_Large_boxTrue_Large_size1.5_Dyamic_DetFalse_det_len30_Median_face_boxFalse/saved_test_outputs
+  USE_LAST_EPOCH: false
+TRAIN:
+  BATCH_SIZE: 4
+  DATA:
+    BEGIN: 0.0
+    CACHED_PATH: /home/changmin/data/MAHNOB_HCI_Emotion_Preprocessed/MAHNOB-HCI_SizeW128_SizeH128_ClipLength128_DataTypeDiffNormalized_DataAugNone_LabelTypeDiffNormalized_Crop_faceTrue_BackendHC_Large_boxTrue_Large_size1.5_Dyamic_DetFalse_det_len30_Median_face_boxFalse
+    DATASET: MAHNOB-HCI
+    DATA_FORMAT: NDHWC
+    DATA_PATH: /home/changmin/data/MAHNOB_HCI_Emotion
+    DO_PREPROCESS: false
+    END: 0.8
+    EXP_DATA_NAME: MAHNOB-HCI_SizeW128_SizeH128_ClipLength128_DataTypeDiffNormalized_DataAugNone_LabelTypeDiffNormalized_Crop_faceTrue_BackendHC_Large_boxTrue_Large_size1.5_Dyamic_DetFalse_det_len30_Median_face_boxFalse
+    FILE_LIST_PATH: /home/changmin/data/MAHNOB_HCI_Emotion_Preprocessed/DataFileLists/MAHNOB-HCI_SizeW128_SizeH128_ClipLength128_DataTypeDiffNormalized_DataAugNone_LabelTypeDiffNormalized_Crop_faceTrue_BackendHC_Large_boxTrue_Large_size1.5_Dyamic_DetFalse_det_len30_Median_face_boxFalse_0.0_0.8.csv
+    FILTERING:
+      EXCLUSION_LIST:
+      - ''
+      SELECT_TASKS: false
+      TASK_LIST:
+      - ''
+      USE_EXCLUSION_LIST: false
+    FOLD:
+      FOLD_NAME: ''
+      FOLD_PATH: ''
+    FOLD_INDEX: 0
+    FS: 30
+    INFO:
+      EXERCISE:
+      - true
+      GENDER:
+      - ''
+      GLASSER:
+      - true
+      HAIR_COVER:
+      - true
+      LIGHT:
+      - ''
+      MAKEUP:
+      - true
+      MOTION:
+      - ''
+      SKIN_COLOR:
+      - 1
+    LABEL_COLUMN: BC_Arsl
+    LABEL_SOURCE: CSV
+    NUM_FOLDS: 5
+    PREPROCESS:
+      BIGSMALL:
+        BIG_DATA_TYPE:
+        - ''
+        RESIZE:
+          BIG_H: 144
+          BIG_W: 144
+          SMALL_H: 9
+          SMALL_W: 9
+        SMALL_DATA_TYPE:
+        - ''
+      CHUNK_LENGTH: 128
+      CROP_FACE:
+        BACKEND: HC
+        DETECTION:
+          DO_DYNAMIC_DETECTION: false
+          DYNAMIC_DETECTION_FREQUENCY: 30
+          USE_MEDIAN_FACE_BOX: false
+        DO_CROP_FACE: true
+        LARGE_BOX_COEF: 1.5
+        USE_LARGE_FACE_BOX: true
+      DATA_AUG:
+      - None
+      DATA_TYPE:
+      - DiffNormalized
+      DO_CHUNK: true
+      IBVP:
+        DATA_MODE: RGB
+      LABEL_TYPE: DiffNormalized
+      RESIZE:
+        H: 128
+        W: 128
+      USE_PSUEDO_PPG_LABEL: false
+    SPLIT_METHOD: ''
+    current_subject: null
+  EPOCHS: 50
+  LR: 0.0001
+  MODEL_FILE_NAME: Arsl_BC_PhysMamba_Normal_TemporalBranch
+  NUM_CLASSES: 2
+  OPTIMIZER:
+    BETAS:
+    - 0.9
+    - 0.999
+    EPS: 0.0001
+    MOMENTUM: 0.9
+  PLOT_LOSSES_AND_LR: true
+  WARMUP_EPOCHS: 20
+UNSUPERVISED:
+  DATA:
+    BEGIN: 0.0
+    CACHED_PATH: PreprocessedData/_SizeW128_SizeH128_ClipLength180_DataType_DataAugNone_LabelType_Crop_faceTrue_BackendHC_Large_boxTrue_Large_size1.5_Dyamic_DetFalse_det_len30_Median_face_boxFalse_unsupervised
+    DATASET: ''
+    DATA_FORMAT: NDCHW
+    DATA_PATH: ''
+    DO_PREPROCESS: false
+    END: 1.0
+    EXP_DATA_NAME: _SizeW128_SizeH128_ClipLength180_DataType_DataAugNone_LabelType_Crop_faceTrue_BackendHC_Large_boxTrue_Large_size1.5_Dyamic_DetFalse_det_len30_Median_face_boxFalse_unsupervised
+    FILE_LIST_PATH: PreprocessedData/DataFileLists/_SizeW128_SizeH128_ClipLength180_DataType_DataAugNone_LabelType_Crop_faceTrue_BackendHC_Large_boxTrue_Large_size1.5_Dyamic_DetFalse_det_len30_Median_face_boxFalse_unsupervised_0.0_1.0.csv
+    FILTERING:
+      EXCLUSION_LIST:
+      - ''
+      SELECT_TASKS: false
+      TASK_LIST:
+      - ''
+      USE_EXCLUSION_LIST: false
+    FOLD:
+      FOLD_NAME: ''
+      FOLD_PATH: ''
+    FOLD_INDEX: 0
+    FS: 0
+    INFO:
+      EXERCISE:
+      - true
+      GENDER:
+      - ''
+      GLASSER:
+      - true
+      HAIR_COVER:
+      - true
+      LIGHT:
+      - ''
+      MAKEUP:
+      - true
+      MOTION:
+      - ''
+      SKIN_COLOR:
+      - 1
+    LABEL_COLUMN: ''
+    LABEL_SOURCE: PPG
+    NUM_FOLDS: 5
+    PREPROCESS:
+      CHUNK_LENGTH: 180
+      CROP_FACE:
+        BACKEND: HC
+        DETECTION:
+          DO_DYNAMIC_DETECTION: false
+          DYNAMIC_DETECTION_FREQUENCY: 30
+          USE_MEDIAN_FACE_BOX: false
+        DO_CROP_FACE: true
+        LARGE_BOX_COEF: 1.5
+        USE_LARGE_FACE_BOX: true
+      DATA_AUG:
+      - None
+      DATA_TYPE:
+      - ''
+      DO_CHUNK: true
+      IBVP:
+        DATA_MODE: RGB
+      LABEL_TYPE: ''
+      RESIZE:
+        H: 128
+        W: 128
+      USE_PSUEDO_PPG_LABEL: false
+    SPLIT_METHOD: ''
+    current_subject: null
+  METHOD: []
+  METRICS: []
+  OUTPUT_SAVE_DIR: ''
+VALID:
+  BATCH_SIZE: 1
+  DATA:
+    BEGIN: 0.8
+    CACHED_PATH: /home/changmin/data/MAHNOB_HCI_Emotion_Preprocessed/MAHNOB-HCI_SizeW128_SizeH128_ClipLength128_DataTypeDiffNormalized_DataAugNone_LabelTypeDiffNormalized_Crop_faceTrue_BackendHC_Large_boxTrue_Large_size1.5_Dyamic_DetFalse_det_len30_Median_face_boxFalse
+    DATASET: MAHNOB-HCI
+    DATA_FORMAT: NDHWC
+    DATA_PATH: /home/changmin/data/MAHNOB_HCI_Emotion
+    DO_PREPROCESS: false
+    END: 0.9
+    EXP_DATA_NAME: MAHNOB-HCI_SizeW128_SizeH128_ClipLength128_DataTypeDiffNormalized_DataAugNone_LabelTypeDiffNormalized_Crop_faceTrue_BackendHC_Large_boxTrue_Large_size1.5_Dyamic_DetFalse_det_len30_Median_face_boxFalse
+    FILE_LIST_PATH: /home/changmin/data/MAHNOB_HCI_Emotion_Preprocessed/DataFileLists/MAHNOB-HCI_SizeW128_SizeH128_ClipLength128_DataTypeDiffNormalized_DataAugNone_LabelTypeDiffNormalized_Crop_faceTrue_BackendHC_Large_boxTrue_Large_size1.5_Dyamic_DetFalse_det_len30_Median_face_boxFalse_0.8_0.9.csv
+    FILTERING:
+      EXCLUSION_LIST:
+      - ''
+      SELECT_TASKS: false
+      TASK_LIST:
+      - ''
+      USE_EXCLUSION_LIST: false
+    FOLD:
+      FOLD_NAME: ''
+      FOLD_PATH: ''
+    FOLD_INDEX: 0
+    FS: 30
+    INFO:
+      EXERCISE:
+      - true
+      GENDER:
+      - ''
+      GLASSER:
+      - true
+      HAIR_COVER:
+      - true
+      LIGHT:
+      - ''
+      MAKEUP:
+      - true
+      MOTION:
+      - ''
+      SKIN_COLOR:
+      - 1
+    LABEL_COLUMN: BC_Arsl
+    LABEL_SOURCE: CSV
+    NUM_FOLDS: 5
+    PREPROCESS:
+      BIGSMALL:
+        BIG_DATA_TYPE:
+        - ''
+        RESIZE:
+          BIG_H: 144
+          BIG_W: 144
+          SMALL_H: 9
+          SMALL_W: 9
+        SMALL_DATA_TYPE:
+        - ''
+      CHUNK_LENGTH: 128
+      CROP_FACE:
+        BACKEND: HC
+        DETECTION:
+          DO_DYNAMIC_DETECTION: false
+          DYNAMIC_DETECTION_FREQUENCY: 30
+          USE_MEDIAN_FACE_BOX: false
+        DO_CROP_FACE: true
+        LARGE_BOX_COEF: 1.5
+        USE_LARGE_FACE_BOX: true
+      DATA_AUG:
+      - None
+      DATA_TYPE:
+      - DiffNormalized
+      DO_CHUNK: true
+      IBVP:
+        DATA_MODE: RGB
+      LABEL_TYPE: DiffNormalized
+      RESIZE:
+        H: 128
+        W: 128
+      USE_PSUEDO_PPG_LABEL: false
+    SPLIT_METHOD: ''
+    current_subject: null

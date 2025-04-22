@@ -1,0 +1,5 @@
+*.so
+*.wandb
+wandb_logs/
+__pycache__/
+*.pyc
