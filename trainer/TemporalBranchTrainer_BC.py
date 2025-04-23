@@ -276,7 +276,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
         
         wandb.init(
             project="TemporalReMOTION",
-            name=f"Exp_{self.config.TRAIN.MODEL_FILE_NAME}_CosSim_NoEntimax",
+            name=f"Exp_{self.config.TRAIN.MODEL_FILE_NAME}_Final",
             # config=cfg_dict,
             dir="./wandb_logs"
         )
@@ -581,7 +581,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
             raw_scores = self.attn_scorer(chunk_embeds)  # (1, T, 1)
             
             # Step 1.4: Gated pooling for session-level CE
-            pooled, attn_weights, entropy = self.pooling(chunk_embeds, return_weights=True, return_entropy=True)
+            pooled, attn_weights, entropy = self.pooling(chunk_embeds, raw_scores, return_weights=True, return_entropy=True)
             
             if epoch < 10: # Phase 0.0
                 attn_weights = F.softmax(raw_scores / self.temperature, dim=1)
@@ -669,13 +669,19 @@ class TemporalBranchTrainer_BC(BaseTrainer):
 
         # === Step 7: Total Loss Composition ===
         if phase == 0:
+            chunk_ce_loss = torch.tensor(0.0, device=self.device)
+            chunk_ce_loss_scaled = torch.tensor(0.0, device=self.device)
             loss_total = contrastive_term_scaled
         elif phase == 1:
             # === Step 6: Chunk-level CE Loss ===
+            contrastive_term = torch.tensor(0.0, device=self.device)
+            contrastive_term_scaled = torch.tensor(0.0, device=self.device)
             chunk_ce_loss = torch.stack(chunk_ce_losses).mean() if len(chunk_ce_losses) > 0 else torch.tensor(0.0, device=self.device)
             chunk_ce_loss_scaled = self.chunk_ce_weight * chunk_ce_loss
             loss_total = chunk_ce_loss_scaled
         else:
+            chunk_ce_loss = torch.tensor(0.0, device=self.device)
+            chunk_ce_loss_scaled = torch.tensor(0.0, device=self.device)
             loss_total = ce_loss_scaled
 
         preds = torch.argmax(outputs, dim=1)
@@ -686,13 +692,13 @@ class TemporalBranchTrainer_BC(BaseTrainer):
 
         print("\n📊 [Loss Breakdown & Prediction]")
         print("─" * 60)
-        print(f"🔧 Loss Weights:\n   ▸ CE         : {self.ce_weight:.2f}\n   ▸ Contrastive: {self.contrastive_weight:.2f}\n    ▸ ChunkCE    : {self.chunk_ce_weight:.2f}   ▸ Sparsity   : {self.sparsity_weight:.2f}\n")
-        print("\n📉 Loss Components:")
+        print(f"🔧 Loss Weights:\n   ▸ CE         : {self.ce_weight:.2f}\n   ▸ Contrastive: {self.contrastive_weight:.2f}\n    ▸ ChunkCE    : {self.chunk_ce_weight:.2f}")
+        print("\n📉 Loss Components (PHASE {phase}):")
         print(f"   ▸ CE         : {ce_loss.item():.4f} × {self.ce_weight:.2f} = {ce_loss_scaled.item():.4f}")
         print(f"   ▸ Contrastive: {contrastive_term.item():.4f} × {self.contrastive_weight:.2f} = {contrastive_term_scaled.item():.4f}")
-        print(f"   ▸ Sparsity   : {sparsity_loss.item():.4f} x {self.sparsity_weight:.2f} = {sparsity_loss_scaled.item():.4f}")
         print(f"   ▸ Chunk CE   : {chunk_ce_loss.item():.4f} x {self.ce_weight:.2f} = {ce_loss_scaled.item():.4f}")
         print(f"   ▸ Entropy    : Scorer = {entropy_attn_mean:.4f}, Gated = {entropy_gated_mean:.4f}")
+        print(f"   ▸ Sparsity   : {sparsity_loss.item():.4f}")
         print(f"   ▶ Total Loss : {loss_total.item():.4f}")
         print("─" * 60)
 
@@ -760,7 +766,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
             print(f"🧠 [Epoch {epoch}/{self.max_epoch}] - Training Phase {phase}")
             print("-" * 80)
             print("🔧 Loss Scheduling:")
-            print(f"   ▸ CE         : {'Inactive (Current Phase: {phase})' if self.ce_weight == 0.0 else f'Phase 2 Ramping Up({self.ce_weight:.2f})' if self.ce_weight < 1.0 else 'Fully Active'}")
+            print(f"   ▸ CE         : {'Inactive' if self.ce_weight == 0.0 else f'Phase 2 Ramping Up({self.ce_weight:.2f})' if self.ce_weight < 1.0 else 'Fully Active'}")
             print(f"   ▸ Contrastive: {'Off' if self.contrastive_weight == 0.0 else f'Decaying ({self.contrastive_weight:.2f})' if self.contrastive_weight < 1.0 else 'Full'}")
             print(f"   ▸ Chunk CE   : {'On ({:.2f})'.format(self.chunk_ce_weight) if self.chunk_ce_weight > 0 else '[OFF]'}")
             if phase < 1:
