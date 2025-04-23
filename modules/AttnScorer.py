@@ -15,7 +15,7 @@ class AttnScorer(nn.Module):
     supervised contrastive learning (SupConLossTopK).
     """
 
-    def __init__(self, input_dim, temperature=0.5):
+    def __init__(self, input_dim): # , temperature=0.5):
         """
         Initializes the attention scorer module.
 
@@ -24,7 +24,7 @@ class AttnScorer(nn.Module):
             temperature (float): Temperature scaling factor for softmax sharpness.
         """
         super().__init__()
-        self.temperature = temperature
+        #self.temperature = temperature
 
         # The scorer is a 2-layer feedforward network with Tanh activation in between.
         # It compresses the D-dimensional input to a single scalar score per chunk.
@@ -34,7 +34,7 @@ class AttnScorer(nn.Module):
             nn.Linear(input_dim // 2, 1)           # Outputs a scalar score
         )
 
-    def forward(self, z, return_entropy=False):
+    def forward(self, z):
         """
         Args:
             z (Tensor): (B, T, D) chunk embeddings
@@ -45,7 +45,9 @@ class AttnScorer(nn.Module):
             entropy (optional): scalar tensor for entropy loss
         """
         scores = self.scorer(z)  # Raw attention scores: (B, T, 1)
-        scores = scores - scores.mean(dim=1, keepdim=True) # Center the scores (zero-mean across time dimension) for stability
+        raw_scores = scores - scores.mean(dim=1, keepdim=True) # Center the scores (zero-mean across time dimension) for stability
+        
+        """
         attn_scores = F.softmax(scores / self.temperature, dim=1) # Apply softmax across time (T) with temperature scaling: (B, T, 1)
 
         if return_entropy:
@@ -53,3 +55,7 @@ class AttnScorer(nn.Module):
             return attn_scores, entropy
         else:
             return attn_scores # These scores are only used to rank/select Top-K chunks; not used for pooling.
+        """
+        
+        return raw_scores # return pre-softmax raw attn score
+        

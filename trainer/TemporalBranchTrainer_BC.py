@@ -1,4 +1,23 @@
 """
+
+rPPG → TemporalBranch → Chunk Embedding
+                      ↓
+               AttnScorer (raw score)
+                      ↓
+        ┌─────────────┴──────────────┐
+        │                            │
+   SupConLoss / ChunkCE         GatedPooling
+        ↓                            ↓
+    Representation             Session Embedding
+                                 ↓
+                         ClassificationHead
+
+
+
+
+
+
+
 =======================================================
 🧠 Emotion Recognition Model - End-to-End Architecture
 =======================================================
@@ -165,6 +184,7 @@ import yaml
 import wandb
 
 import math
+import entmax
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -177,7 +197,6 @@ from torch.utils.data import DataLoader
 
 from tqdm import tqdm
 from functools import partial
-from collections import Counter
 from sklearn.metrics import accuracy_score, confusion_matrix, f1_score
 
 from trainer.BaseTrainer import BaseTrainer
@@ -185,15 +204,16 @@ from neural_encoders.model.PhysMamba import PhysMamba
 
 from decoders.TemporalBranch import TemporalBranch
 
-from modules.AttnScorer import AttnScorer
+from modules.AttnScorer import AttnScorer           # Returns pre-softmax raw attn score
+from modules.GatedPooling import GatedPooling       # No attn inside, takes extrernal attn raw score from AttnScorer
 from modules.ProjectionHead import ProjectionHead
 from modules.ChunkForward import ChunkForwardModule
 from modules.ClassificationHead import ClassificationHead
 from modules.ChunkAuxClassifier import ChunkAuxClassifier
-from modules.TopKPooling import TopKSoftPooling
-from modules.GatedAttentionPooling import GatedAttentionPooling
+# from modules.TopKPooling import TopKSoftPooling
+# from modules.GatedAttentionPooling import GatedAttentionPooling
 
-from tools.utils import SupConLossTopK, AlignCosineLoss
+from tools.utils import SupConLossTopK# , AlignCosineLoss
 from tools.utils import reconstruct_sessions, run_tsne_and_plot
 
 class TemporalBranchTrainer_BC(BaseTrainer):
@@ -251,7 +271,8 @@ class TemporalBranchTrainer_BC(BaseTrainer):
         self.max_epoch = config.TRAIN.EPOCHS
         self.batch_size = config.TRAIN.BATCH_SIZE
         self.warm_up = config.TRAIN.WARMUP_EPOCHS 
-        self.decay = 1e-4  # weight decay factor
+        self.optimizer_config = {}
+        self.temperature = 1.0
         
         wandb.init(
             project="TemporalReMOTION",
@@ -293,10 +314,9 @@ class TemporalBranchTrainer_BC(BaseTrainer):
 
         # ------------------------------ Attention Scorer ------------------------------
         self.attn_scorer = AttnScorer(
-            input_dim=config.MODEL.EMOTION.TEMPORAL_EMBED_DIM,
-            temperature=1.0
+            input_dim=config.MODEL.EMOTION.TEMPORAL_EMBED_DIM
+            # temperature=0.7
         ).to(self.device)
-        # self.alpha = 0.5 # diversity-attention balance: 0.0 ~ 1.0
         
         # ------------------------------ Projection Head -------------------------------
         """Maps chunk embeddings to a projection space for contrastive learning"""
@@ -313,21 +333,12 @@ class TemporalBranchTrainer_BC(BaseTrainer):
             num_classes=config.TRAIN.NUM_CLASSES
         ).to(self.device)
         
-        # ------------------------------ Top-K Soft Pooling ------------------------------
-        """Top-K chunk selection based on attention scores for KL alignment"""
-        self.topk_pooler = TopKSoftPooling(
-            input_dim=config.MODEL.EMOTION.TEMPORAL_EMBED_DIM,
-            temperature=1.0
-        ).to(self.device)
-        
         # ------------------------------ Gated Attention Pooling ------------------------------
         """Aggregates chunk embeddings to a session-level embedding using Gated self-attention
            Includes entropy regularization (used in sparsity loss)"""
-        self.pooling = GatedAttentionPooling(
-            input_dim=config.MODEL.EMOTION.TEMPORAL_EMBED_DIM,
-            temperature=0.7
+        self.pooling = GatedPooling(
+            input_dim=config.MODEL.EMOTION.TEMPORAL_EMBED_DIM
         ).to(self.device)
-        self.sparsity_weight = 0.3
 
         # ----------------------------- Classification Head -----------------------------
         """Simple MLP head for predicting emotion labels from pooled session embedding"""
@@ -335,8 +346,6 @@ class TemporalBranchTrainer_BC(BaseTrainer):
             input_dim=config.MODEL.EMOTION.TEMPORAL_EMBED_DIM,
             num_classes=config.TRAIN.NUM_CLASSES
         ).to(self.device)
-        for p in self.classifier.parameters():
-            p.requires_grad = False
 
         # ----------------------------- Chunk Forward Module ----------------------------
         self.chunk_forward_module = ChunkForwardModule(
@@ -356,36 +365,15 @@ class TemporalBranchTrainer_BC(BaseTrainer):
         self.criterion = nn.CrossEntropyLoss() # <================================ HOW ABOUT FOCAL LOSS???
         self.ce_weight = 0.0
         
-        """AlignCosineLoss: cosine distance between Top-K pooled vs Gated pooled embeddings.
-        Encourages representational alignment across attention streams."""
+        """
+        AlignCosineLoss: cosine distance between Top-K pooled vs Gated pooled embeddings.
+        Encourages representational alignment across attention streams.
         self.cosinse_criterion = AlignCosineLoss()
-
-        # ------------------------------- Optimizer Setup -------------------------------
-        param_groups = {'decay': [], 'no_decay': []}
-        for module in [
-            self.temporal_branch, self.attn_scorer, self.pooling, self.chunk_projection, 
-            self.chunk_aux_classifier, self.classifier
-        ]:
-            for name, param in module.named_parameters():
-                wd = 0.0 if ("bias" in name or "LayerNorm" in name) else self.decay
-                param_groups['no_decay' if wd == 0.0 else 'decay'].append({"params": param, "weight_decay": wd})
-
-        self.optimizer = optim.AdamW(
-            param_groups['decay'] + param_groups['no_decay'],
-            lr=config.TRAIN.LR
-        )
-
-        # ---------------------------- Learning Rate Scheduler ----------------------------
-        self.scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            self.optimizer, T_0=10, T_mult=2, eta_min=1e-6
-        )
         """
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer,
-            T_max=self.max_epoch,  # 20
-            eta_min=1e-6
-        )
-        """
+
+        # ------------------------------ Optimizer & Scheduler -----------------------------
+        self.optimizer = None
+        self.scheduler = None
         
         # ---------------------------- Session Reconstruction ----------------------------
         self.reconstruct_sessions = partial(reconstruct_sessions, self)
@@ -394,6 +382,8 @@ class TemporalBranchTrainer_BC(BaseTrainer):
         self.run_tsne_and_plot = partial(run_tsne_and_plot, self)
         
         # -------------------------------- History Tracking --------------------------------
+        self.avg_entropy_attn = None
+        
         self.best_train_loss = float('inf')
         self.best_cos_loss = float('inf')
         self.best_chunk_ce_loss = float('inf')
@@ -416,8 +406,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
         self.chunk_labels_for_tsne = []
         self.session_embeddings_for_tsne = []
         self.session_labels_for_tsne = []
-
-
+    
     def forward_chunk(self, chunk):
         """
         Forward pass for a single chunk.
@@ -436,147 +425,129 @@ class TemporalBranchTrainer_BC(BaseTrainer):
             return checkpoint.checkpoint(self.forward_chunk, chunk)
         else:
             return self.forward_chunk(chunk)
-    
-    def update_loss_weights_by_epoch(self, epoch, avg_entropy_attn=None, avg_entropy_gated=None, apply_entropy_update=True):
-        """
-        Update dynamic loss weights, gradient flow, top-k ratio,
-        and temperature/thresholds based on current epoch and entropy.
         
-        Phase-aware dynamic scheduling of:
-        - Loss weights (SupCon, CE, KL, ChunkAux, Sparsity)
-        - Gradient control for key modules (AttnScorer, Projection, Classifier, etc.)
-        - Top-K sampling ratio and temperature decay
-        
-        Grad flow control:
-         - Classifier receives CE input from epoch 20 onward
-         - But gradient is enabled only from epoch 30 for stable CE ramp-up
+    def update_training_state(self, epoch):
         """
+        Unified phase-aware training control:
+        - Sets loss weights, temperature, top-k ratio
+        - Controls gradient flow
+        - Configures optimizer/scheduler
+        
+        Phase 0 (0–19): SupCon + Entropy Temperature Control
+        Phase 1 (20–34): Chunk CE + Top-K
+        Phase 2 (35–49): Final CE + Classifier + GatedPooling
+        """
+        PHASE0_END = 19
+        PHASE1_END = 34
+        PHASE2_END = self.max_epoch - 1
 
-        warmup_epoch = self.warm_up              # 0 ~ 19
-        ce_ramp_epochs = 25                      # 20 ~ 44
-        ce_ramp_end = warmup_epoch + ce_ramp_epochs
-        supcon_cutoff = 35                       # after this, SupCon off
-        aux_ce_cutoff = 34
+        if epoch <= PHASE0_END:
+            phase = 0
+            lr, wd, t_max = 3e-4, 1e-4, 20
+            self.contrastive_weight = max(0.2, 1.0 - 0.8 * (epoch / PHASE0_END))
+            self.chunk_ce_weight = 0.0
+            self.ce_weight = 0.0
+            self.pooling.temperature = 0.7
+            if self.avg_entropy_attn is not None:
+                self.temperature = max(0.7, 1.2 - self.avg_entropy_attn)
+            elif self.avg_entropy_attn is None:
+                self.temperatur = 0.7
+            else:
+                self.temperature = 1.0
 
-        # ===== SupCon weight schedule =====
-        # SupCon Weight (from 1.0 → 0.2 → 0.05 → 0)
-        if epoch < warmup_epoch:
-            self.contrastive_weight = 1.0
-        elif epoch < 25:
-            self.contrastive_weight = max(0.2, 1.0 - ((epoch - warmup_epoch) / 5) * 0.8)  # → 0.2
-        elif epoch < supcon_cutoff:
-            self.contrastive_weight = max(0.05, 0.2 - ((epoch - 25) / (supcon_cutoff - 25)) * 0.15)
-        else:
+        elif epoch <= PHASE1_END:
+            phase = 1
+            lr, wd, t_max = 2e-4, 5e-5, 15
             self.contrastive_weight = 0.0
-
-        # ===== CE loss ramp-up schedule =====
-        if epoch < warmup_epoch:
+            self.chunk_ce_weight = 0.3
             self.ce_weight = 0.0
-        elif epoch < 30:
-            progress = (epoch - warmup_epoch) / (30 - warmup_epoch)
-            self.ce_weight = 1.0 / (1.0 + math.exp(-10 * (progress - 0.5))) * 0.7
+            self.temperature = 1.0
+
         else:
-            self.ce_weight = min(1.0, 0.7 + (epoch - 30) / (ce_ramp_end - 30) * 0.3)
-        """
-        if epoch < warmup_epoch:
-            self.ce_weight = 0.0
-        elif epoch < 30:
-            # ramp up faster to prepare classifier input
-            self.ce_weight = min(1.0, (epoch - warmup_epoch) / (30 - warmup_epoch) * 0.7)
-        else:
-            # ramp up smoothly to full
-            self.ce_weight = min(1.0, 0.7 + (epoch - 30) / (ce_ramp_end - 30) * 0.3)
-        """
+            phase = 2
+            lr, wd, t_max = 1e-4, 5e-5, 10
+            self.contrastive_weight = 0.0
+            self.chunk_ce_weight = 0.0
+            self.ce_weight = 1.0
+            self.temperature = 1.0
 
-        # ===== Sparsity loss decay =====
-        if epoch < warmup_epoch:
-            self.sparsity_weight = 0.3
-        elif epoch < ce_ramp_end:
-            self.sparsity_weight = 0.3 * (1 - (epoch - warmup_epoch) / ce_ramp_epochs)
-        else:
-            self.sparsity_weight = 0.05
-
-        # ===== Chunk-level CE (Top-K + session label) =====
-        self.chunk_ce_weight = 0.0 if epoch < 20 else (0.2 if epoch <= aux_ce_cutoff else 0.0)
-
-        # ===== KL AlignLoss weight =====
-        self.align_weight = 0.3 if 25 <= epoch <= 35 else 0.0
-
-        # ===== Top-K ratio schedule =====
-        self.top_k_ratio = max(0.2, 0.5 - 0.4 * (epoch / self.max_epoch))
-
-        # ===== Contrastive temperature decay =====
-        self.contrastive_loss_fn.temperature = 0.1 # (fixed low)
-        # self.contrastive_loss_fn.temperature = max(0.07, 0.3 - 0.23 * (epoch / self.max_epoch))
-
-        # ===== Gradient control: AttnScorer, ProjectionHead, TopKPooling, Classifier, GatedPooling, AuxCE =====
+        # Gradients
         for p in self.attn_scorer.parameters():
-            p.requires_grad = epoch < supcon_cutoff
-
+            p.requires_grad = (phase <= 1)
         for p in self.chunk_projection.parameters():
-            p.requires_grad = epoch < supcon_cutoff
-
-        for p in self.pooling.parameters():
-            p.requires_grad = epoch >= 15
-        
-        for p in self.topk_pooler.parameters():
-            p.requires_grad = (epoch >= 15 and epoch <= 34)
-
-        for p in self.classifier.parameters():
-            p.requires_grad = epoch >= 30
-
+            p.requires_grad = (phase <= 1)
         for p in self.chunk_aux_classifier.parameters():
-            p.requires_grad = 20 <= epoch <= aux_ce_cutoff
+            p.requires_grad = (phase == 1)
+        for p in self.pooling.parameters():
+            p.requires_grad = (phase == 2)
+        for p in self.classifier.parameters():
+            p.requires_grad = (phase == 2)
+
+        # Top-K Ratio
+        self.top_k_ratio = max(0.2, 0.5 - 0.3 * (epoch / PHASE2_END))
+
+        # Reconfigure optimizer/scheduler per phase
+        self.configure_optimizer_scheduler(lr, wd, t_max)
         
-        # ===== Adaptive temperature/threshold scheduling =====
-        if epoch < 20 and apply_entropy_update:
-            if avg_entropy_attn is not None:
-                self.attn_scorer.temperature = max(0.7, 1.2 - avg_entropy_attn)
-            """
-            if avg_entropy_gated is not None:
-                self.pooling.temperature = max(0.3, 1.2 - avg_entropy_gated)
-            """
-            # GatedPooling: fixed
-            self.pooling.temperature = 0.7  # fixed, stable CE learning
-            
-        # ===== SupConLoss sampling scheduling (e.g., threshold, top-k mask, etc.) =====
+        # SupConLoss sampling scheduling (e.g., threshold, top-k mask, etc.)
         self.contrastive_loss_fn.schedule_params(epoch, self.max_epoch)
+        
+        return phase
 
-    def forward_batch(self, batch, epoch):
+    def configure_optimizer_scheduler(self, lr, weight_decay, t_max):
         """
-            Forward function for one training batch (B sessions) during epoch `epoch`.
+        Configures optimizer and scheduler for the current phase.
+        Automatically resets learning rate and weight decay per phase.
+        """
+        param_groups = {'decay': [], 'no_decay': []}
+        for module in [
+            self.temporal_branch, self.attn_scorer, self.pooling,
+            self.chunk_projection, self.chunk_aux_classifier, self.classifier
+        ]:
+            for name, param in module.named_parameters():
+                if not param.requires_grad:
+                    continue
+                group = 'no_decay' if ("bias" in name or "LayerNorm" in name) else 'decay'
+                param_groups[group].append({"params": param, "weight_decay": 0.0 if group == 'no_decay' else weight_decay})
 
-            Handles:
-            - TemporalBranch → chunk-wise rPPG embeddings
-            - AttnScorer attention: softmax (0–19), raw scores (20+)
-            - SupConLossTopK with Top-K + threshold selection from epoch ≥ 20
-            - GatedPooling for CE loss
-            - TopKSoftPooling for KLAlignLoss (epoch 25–35)
-            - ChunkAuxClassifier (epoch 20–34 only) for chunk-level CE supervision
-            - SparsityLoss based on entropy: AttnScorer (<35) vs Gated (≥35)
-            - t-SNE logging for chunk/session visualization
-            - Full debug printouts for embeddings, attention, entropy, losses
+        self.optimizer = optim.AdamW(param_groups['decay'] + param_groups['no_decay'], lr=lr)
+        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=t_max, eta_min=1e-6)
+        # self.scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(self.optimizer, T_0=10, T_mult=2, eta_min=1e-6)
+
+    
+    def forward_batch(self, batch, epoch, phase):
+        """
+        Forward function for one training batch (B sessions) during epoch `epoch`.
+
+        Handles phase-wise:
+        - Phase 0: SupConLossTopK + adaptive temperature
+        - Phase 1: Chunk-level CE with Top-K + threshold
+        - Phase 2: Session-level CE with GatedPooling
+        
+        Handles:
+        - TemporalBranch → chunk-wise rPPG embeddings
+        - AttnScorer: pre-softmax raw score
+        - SupConLossTopK with Top-K + threshold selection from epoch ≥ 20
+        - GatedPooling for CE loss
+        - ChunkAuxClassifier (epoch 20–34 only) for chunk-level CE supervision
+        - SparsityLoss based on entropy: AttnScorer vs Gated
+        - t-SNE logging for chunk/session visualization
+        - Full debug printouts for embeddings, attention, entropy, losses
+        
+        Additional:
+        - t-SNE logging
+        - Attention entropy debug
+        - Full loss composition & debug prints
         """
 
         chunk_tensors, batch_labels, batch_session_ids, _ = batch
         B = len(batch_labels)
 
-        self.chunk_embeddings_for_tsne.clear()
-        self.chunk_labels_for_tsne.clear()
-        self.session_embeddings_for_tsne.clear()
-        self.session_labels_for_tsne.clear()
-
         # === Step 0: Initialization ===
-        session_embeds = []
-        target_labels = []
-        entropy_list = []
+        session_embeds, target_labels = [], []
         all_proj_embeddings, all_labels_tensor, all_attn_weights = [], [], []
-        all_aux_logits, all_aux_labels = [], []
-        all_topk_embeds = []
-        chunk_ce_losses = []  # Per-session chunk-level CE loss
-        per_session_topk_embeds = []  # For KL alignment
-        entropy_attn_list = []
-        entropy_gated_list = []
+        chunk_ce_losses, entropy_list = [], []  # Per-session chunk-level CE loss and entropy debugging
+        entropy_attn_list, entropy_gated_list = [], []
 
         # === Step 1: Iterate each session in batch ===
         for i in range(B):
@@ -607,70 +578,73 @@ class TemporalBranchTrainer_BC(BaseTrainer):
                 self.chunk_labels_for_tsne.append(label)
 
             # Step 1.3: Compute attention weights
-            attn_scored, entropy_attn = self.attn_scorer(chunk_embeds, return_entropy=True)
-            if epoch < 20:
-                attn_weights = F.softmax(attn_scored / self.attn_scorer.temperature, dim=1)
-            else:
-                attn_weights = attn_scored  # Top-K selection applied later
-
+            raw_scores = self.attn_scorer(chunk_embeds)  # (1, T, 1)
+            
             # Step 1.4: Gated pooling for session-level CE
-            pooled, attn_gated, entropy_gated = self.pooling(chunk_embeds, return_weights=True, return_entropy=True)
+            pooled, attn_weights, entropy = self.pooling(chunk_embeds, return_weights=True, return_entropy=True)
+            
+            if epoch < 10: # Phase 0.0
+                attn_weights = F.softmax(raw_scores / self.temperature, dim=1)
+            elif 10 <= epoch < 35: # Phase 0.5 and 1
+                attn_weights = entmax.entmax15(raw_scores, dim=1)
+            else: # Phase 2
+                pass
+
+            # Entropies for adaptive temperature adjusting and debugging
+            if phase < 2:
+                entropy = -torch.sum(attn_weights * torch.log(attn_weights + 1e-8), dim=1).mean()
+                entropy_attn_list.append(entropy.detach())
+            else:
+                entropy_gated_list.append(entropy.detach())
+            
             session_embeds.append(pooled.squeeze(0))
             target_labels.append(label)
+            
+            # --- For session-level t-SNE plot --- 
             self.session_embeddings_for_tsne.append(pooled.squeeze(0).detach().cpu().numpy())
             self.session_labels_for_tsne.append(label)
 
             # Step 1.5: Sparsity regularization loss
-            if epoch < 35:
-                entropy = self.sparsity_weight * entropy_attn
-                entropy_attn_list.append(entropy_attn.detach())
+            if phase < 2:
+                entropy_attn_list.append(entropy.detach())
             else:
-                entropy = self.sparsity_weight * entropy_gated
-                entropy_gated_list.append(entropy_gated.detach())
+                entropy_gated_list.append(entropy.detach())
             entropy_list.append(entropy)
             
             # --- DEBUG: Attention Information ---
-            attn_np = attn_scored.detach().cpu().squeeze().numpy()
-            print(f"[DEBUG][Attn Weights] {attn_np.tolist()}")
-            print(f"[DEBUG][Attn Sparsity] mean={attn_np.mean():.4f}, std={attn_np.std():.4f}, entropy={entropy_attn.item():.4f}")
-            if epoch >= self.warm_up:
-                gated_np = attn_gated.detach().cpu().squeeze().numpy()
-                print(f"[DEBUG][Gated Attn] {gated_np.tolist()}")
-                print(f"[DEBUG][Gated Sparsity] mean={gated_np.mean():.4f}, std={gated_np.std():.4f}, entropy={entropy_gated.item():.4f}")
+            if phase < 2:
+                attn_np = attn_weights.detach().cpu().squeeze().numpy()
+                print(f"[DEBUG][Attn Weights] {attn_np.tolist()}")
+                print(f"[DEBUG][Attn Sparsity] mean={attn_np.mean():.4f}, std={attn_np.std():.4f}, entropy={entropy.item():.4f}")
+            else:
+                gated_np = attn_weights.detach().cpu().squeeze().numpy()
+                print(f"[DEBUG][Gated Attn Weights] {gated_np.tolist()}")
+                print(f"[DEBUG][Gated Attn Sparsity] mean={gated_np.mean():.4f}, std={gated_np.std():.4f}, entropy={entropy.item():.4f}")
             
-            # --- For session-level t-SNE plot --- 
-            sess_emb = pooled.squeeze(0)  # (D,)
-            self.session_embeddings_for_tsne.append(sess_emb.detach().cpu().numpy())
-            self.session_labels_for_tsne.append(label)
-
             # Step 1.6: Store contrastive info (projection + attention)
-            if epoch < 20:
+            if phase < 1:
                 weighted_proj = attn_weights.squeeze(0) * chunk_proj_embeds
                 all_proj_embeddings.append(weighted_proj)
-                all_labels_tensor.append(chunk_labels_tensor)
-                all_attn_weights.append(attn_scored.view(-1))
-            else:
-                all_proj_embeddings.append(chunk_proj_embeds)
-                all_labels_tensor.append(chunk_labels_tensor)
-                all_attn_weights.append(attn_scored.squeeze(0))
+                all_attn_weights.append(attn_weights.view(-1))
+            all_labels_tensor.append(chunk_labels_tensor)
 
-            # Step 1.7: Apply ChunkAuxClassifier on Top-K for CE
-            if 20 <= epoch <= 34 and self.chunk_ce_weight > 0:
-                k = min(num_chunks, max(2, int(num_chunks * self.top_k_ratio)))
-                attn = attn_scored.view(-1)
-                above_thd = (attn > 0.01).nonzero(as_tuple=True)[0]
-                topk_idx = above_thd[torch.topk(attn[above_thd], k=k).indices] if len(above_thd) >= k else torch.topk(attn, k=k).indices
-                topk_embeds = chunk_embeds[0][topk_idx]  # (K, D)
-                per_session_topk_embeds.append(topk_embeds)
+            # Step 1.7: Apply ChunkAuxClassifier on Top-K chunk embeds for discriminativity
+            if phase == 1:
+                attn = raw_scores.squeeze(0).squeeze(-1)
+                if len(attn) < 1:
+                    print("Something's Wrong..")
+                    continue
+                k = min(len(attn), int(len(attn) * self.top_k_ratio))
+                
+                selected_idx = torch.topk(attn, k=k).indices
+                topk_embeds = chunk_embeds[0][selected_idx]  # (K, D)
                 topk_logits = self.chunk_aux_classifier(topk_embeds)
                 topk_labels = torch.tensor([label] * len(topk_logits), dtype=torch.long, device=self.device)
                 loss_i = self.criterion(topk_logits, topk_labels)
                 chunk_ce_losses.append(loss_i)
-            else:
-                per_session_topk_embeds.append(None)
 
         # === Step 2: SupCon Loss ===
-        if epoch < 20:
+        if phase == 0:
             proj_concat = torch.cat(all_proj_embeddings, dim=0)
             label_concat = torch.cat(all_labels_tensor, dim=0)
             if label_concat.unique().numel() >= 2:
@@ -680,36 +654,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
             else:
                 print("[Skip SupCon] Only one unique label in batch.")
                 contrastive_term = torch.tensor(0.0, device=self.device)
-        else:
-            selected_proj, selected_labels = [], []
-            for proj, lbl, attn in zip(all_proj_embeddings, all_labels_tensor, all_attn_weights):
-                if len(attn) < 1:
-                            continue
-                k = min(len(attn), int(len(attn) * self.top_k_ratio))
-                attn = attn.view(-1)
-                threshold = 0.01
-                above_thd = (attn > threshold).nonzero(as_tuple=True)[0]
-
-                # Thresholding
-                if len(above_thd) >= k:
-                    topk_indices = torch.topk(attn[above_thd], k=k).indices
-                    selected_idx = above_thd[topk_indices]
-                else:
-                    selected_idx = torch.topk(attn, k=k).indices
-                selected_proj.append(proj[selected_idx])
-                selected_labels.append(lbl[selected_idx])
-            if len(selected_proj) > 0:
-                proj_concat = torch.cat(selected_proj, dim=0)
-                label_concat = torch.cat(selected_labels, dim=0)
-                if label_concat.unique().numel() >= 2:
-                    proj_norm = F.normalize(proj_concat, dim=-1)
-                    print(f"[DEBUG] norm mean={proj_norm.mean().item():.4f}, std={proj_norm.std().item():.4f}")
-                    contrastive_term = self.contrastive_loss_fn(proj_norm, label_concat)
-                else:
-                    print("[Skip SupCon] Only one unique label in batch.")
-                    contrastive_term = torch.tensor(0.0, device=self.device)
-            else:
-                contrastive_term = torch.tensor(0.0, device=self.device)
+            contrastive_term_scaled = self.contrastive_weight * contrastive_term
 
         # === Step 3: Session-level CE Loss ===
         batch_embeds = torch.stack(session_embeds, dim=0)
@@ -718,70 +663,55 @@ class TemporalBranchTrainer_BC(BaseTrainer):
         ce_loss = self.criterion(outputs, label_tensor)
         ce_loss_scaled = self.ce_weight * ce_loss
 
-        # === Step 4: Sparsity Loss ===
+        # === Step 4: Sparsity Loss (for debugging) ===
         sparsity_loss = torch.stack(entropy_list).mean()
-        sparsity_loss_scaled = self.sparsity_weight * sparsity_loss
-
-        # === Step 5: KL AlignLoss ===
-        cosine_losses = []
-        for i in range(B):
-            if self.align_weight > 0 and per_session_topk_embeds[i] is not None:
-                pooled_topk, _ = self.topk_pooler(per_session_topk_embeds[i]) # (D, )
-                pooled_gated = session_embeds[i] 
-                cosine_sim = self.cosinse_criterion(
-                    pooled_gated.unsqueeze(0), # (1, D)
-                    pooled_topk.unsqueeze(0)   # (1, D)
-                )
-                cosine_losses.append(cosine_sim)
-        cosine_loss = torch.stack(cosine_losses).mean() if len(cosine_losses) > 0 else torch.tensor(0.0, device=self.device)
-        cosine_loss_scaled = self.align_weight * cosine_loss
-
-        # === Step 6: Chunk-level CE Loss ===
-        chunk_ce_loss = torch.stack(chunk_ce_losses).mean() if len(chunk_ce_losses) > 0 else torch.tensor(0.0, device=self.device)
-        chunk_ce_loss_scaled = self.chunk_ce_weight * chunk_ce_loss
+        sparsity_loss_scaled = sparsity_loss
 
         # === Step 7: Total Loss Composition ===
-        contrastive_term_scaled = self.contrastive_weight * contrastive_term
-        loss_total = contrastive_term_scaled + ce_loss_scaled + sparsity_loss_scaled + cosine_loss_scaled + chunk_ce_loss_scaled
+        if phase == 0:
+            loss_total = contrastive_term_scaled
+        elif phase == 1:
+            # === Step 6: Chunk-level CE Loss ===
+            chunk_ce_loss = torch.stack(chunk_ce_losses).mean() if len(chunk_ce_losses) > 0 else torch.tensor(0.0, device=self.device)
+            chunk_ce_loss_scaled = self.chunk_ce_weight * chunk_ce_loss
+            loss_total = chunk_ce_loss_scaled
+        else:
+            loss_total = ce_loss_scaled
 
         preds = torch.argmax(outputs, dim=1)
         
-        # --- for adaptive temperature/threshold scheduling
+        # --- for adaptive temperature scheduling ---
         entropy_attn_mean = torch.stack(entropy_attn_list).mean() if len(entropy_attn_list) > 0 else torch.tensor(0.0, device=self.device)
         entropy_gated_mean = torch.stack(entropy_gated_list).mean() if len(entropy_gated_list) > 0 else torch.tensor(0.0, device=self.device)
 
         print("\n📊 [Loss Breakdown & Prediction]")
         print("─" * 60)
-        print(f"🔧 Loss Weights:\n   ▸ CE         : {self.ce_weight:.2f}\n   ▸ Contrastive: {self.contrastive_weight:.2f}\n   ▸ Sparsity   : {self.sparsity_weight:.2f}\n   ▸ KLAlign    : {self.align_weight:.2f}\n   ▸ ChunkCE    : {self.chunk_ce_weight:.2f}")
+        print(f"🔧 Loss Weights:\n   ▸ CE         : {self.ce_weight:.2f}\n   ▸ Contrastive: {self.contrastive_weight:.2f}\n    ▸ ChunkCE    : {self.chunk_ce_weight:.2f}   ▸ Sparsity   : {self.sparsity_weight:.2f}\n")
         print("\n📉 Loss Components:")
         print(f"   ▸ CE         : {ce_loss.item():.4f} × {self.ce_weight:.2f} = {ce_loss_scaled.item():.4f}")
         print(f"   ▸ Contrastive: {contrastive_term.item():.4f} × {self.contrastive_weight:.2f} = {contrastive_term_scaled.item():.4f}")
         print(f"   ▸ Sparsity   : {sparsity_loss.item():.4f} x {self.sparsity_weight:.2f} = {sparsity_loss_scaled.item():.4f}")
-        print(f"   ▸ Cosine Align   : {cosine_loss.item():.4f} x {self.align_weight:.2f} = {cosine_loss_scaled.item():.4f}")
         print(f"   ▸ Chunk CE   : {chunk_ce_loss.item():.4f} x {self.ce_weight:.2f} = {ce_loss_scaled.item():.4f}")
         print(f"   ▸ Entropy    : Scorer = {entropy_attn_mean:.4f}, Gated = {entropy_gated_mean:.4f}")
         print(f"   ▶ Total Loss : {loss_total.item():.4f}")
         print("─" * 60)
 
         # --- Optional Prediction Logging ---
-        if self.ce_weight > 0:
-            probs = torch.softmax(outputs, dim=1)
-            print("\n🔎 [Batch Predictions]")
-            for i in range(len(label_tensor)):
-                gt = label_tensor[i].item()
-                prob = probs[i].detach().cpu().numpy()
-                pred = np.argmax(prob)
-                confidence = prob[pred]
-                print(f"   ▸ Session {batch_session_ids[i]} | GT: {gt} | Pred: {pred} | Conf: {confidence:.4f} | Prob: {np.round(prob, 4)}")
-            print("═" * 60)
-        else:
-            print("🔎 [Batch Predictions] Skipped (CE not active)")
+        probs = torch.softmax(outputs, dim=1)
+        print("\n🔎 [Batch Predictions]")
+        for i in range(len(label_tensor)):
+            gt = label_tensor[i].item()
+            prob = probs[i].detach().cpu().numpy()
+            pred = np.argmax(prob)
+            confidence = prob[pred]
+            print(f"   ▸ Session {batch_session_ids[i]} | GT: {gt} | Pred: {pred} | Conf: {confidence:.4f} | Prob: {np.round(prob, 4)}")
+        print("═" * 60)
 
         return (
             loss_total, ce_loss, # Full loss for backward
-            contrastive_term_scaled, sparsity_loss_scaled, cosine_loss_scaled, chunk_ce_loss_scaled, # For raw monitoring (Already scaled)
-            sparsity_loss.detach(), preds, label_tensor,
-            chunk_ce_loss.item(), cosine_loss.item(), # For best model check
+            contrastive_term_scaled, sparsity_loss_scaled, chunk_ce_loss_scaled, # For raw monitoring (Already scaled)
+            preds, label_tensor,
+            chunk_ce_loss.item(), # For best model check
             entropy_attn_mean, entropy_gated_mean
         )
 
@@ -798,14 +728,13 @@ class TemporalBranchTrainer_BC(BaseTrainer):
         - TemporalBranch extracts chunk-wise rPPG embeddings
         - AttnScorer assigns attention scores (softmax → entmax → raw score)
         - Top-K + threshold selection for contrastive learning (SupConLossTopK)
-        - GatedAttentionPooling aggregates session embeddings (used for CE)
+        - GatedPooling aggregates session embeddings (used for CE)
         - Classifier makes session-level predictions
 
         🎯 Multi-phase Loss Scheduling:
         - SupConLossTopK: early exploration → Top-K-based → frozen
-        - CE Loss: ramp-up from epoch 20 → dominant in later epochs
+        - CE Loss: ramp-up during phase 2 → dominant in later epochs
         - SparsityLoss: attention entropy regularization
-        - KLAlignLoss: TopKSoftPooling vs GatedPooling logits (epoch 30–44)
         - ChunkAuxClassifier: weak CE on Top-K chunks (epoch 20–34)
         """
         torch.autograd.set_detect_anomaly(True)
@@ -814,7 +743,6 @@ class TemporalBranchTrainer_BC(BaseTrainer):
         self.loss_ce_per_epoch = []
         self.loss_contrastive_per_epoch = []
         self.loss_sparsity_per_epoch = []
-        self.loss_cos_per_epoch = []
         self.loss_chunk_ce_per_epoch = []
 
         for epoch in range(self.max_epoch):
@@ -825,24 +753,23 @@ class TemporalBranchTrainer_BC(BaseTrainer):
             entropy_gated_all = []
 
             # === Temporary call for logging current scheduling phase only ===
-            self.update_loss_weights_by_epoch(epoch, avg_entropy_attn=0.5, avg_entropy_gated=0.5, apply_entropy_update=False)
+            phase = self.update_training_state(epoch)
 
             # === Epoch Settings Print ===
             print("\n" + "=" * 80)
-            print(f"🧠 [Epoch {epoch}/{self.max_epoch}] - Training Phase")
+            print(f"🧠 [Epoch {epoch}/{self.max_epoch}] - Training Phase {phase}")
             print("-" * 80)
             print("🔧 Loss Scheduling:")
-            print(f"   ▸ CE         : {'Inactive (Warm-up)' if self.ce_weight == 0.0 else f'Ramping-up ({self.ce_weight:.2f})' if self.ce_weight < 1.0 else 'Fully Active'}")
+            print(f"   ▸ CE         : {'Inactive (Current Phase: {phase})' if self.ce_weight == 0.0 else f'Phase 2 Ramping Up({self.ce_weight:.2f})' if self.ce_weight < 1.0 else 'Fully Active'}")
             print(f"   ▸ Contrastive: {'Off' if self.contrastive_weight == 0.0 else f'Decaying ({self.contrastive_weight:.2f})' if self.contrastive_weight < 1.0 else 'Full'}")
-            print(f"   ▸ KL Align   : {'On ({:.2f})'.format(self.align_weight) if self.align_weight > 0 else '[OFF]'}")
             print(f"   ▸ Chunk CE   : {'On ({:.2f})'.format(self.chunk_ce_weight) if self.chunk_ce_weight > 0 else '[OFF]'}")
-            print(f"   ▸ Sparsity   : {self.sparsity_weight:.2f}" if self.sparsity_weight > 0 else "   ▸ Sparsity   : [OFF]")
-            print("🎯 SupCon Sampling Strategy:")
-            print(f"   ▸ Max Pos     : {self.contrastive_loss_fn.max_pos}")
-            print(f"   ▸ Max Neg     : {self.contrastive_loss_fn.max_neg}")
-            print(f"   ▸ Pos/Neg Ratio: {self.contrastive_loss_fn.pos_neg_ratio:.2f}")
-            print(f"   ▸ Temperature : {self.contrastive_loss_fn.temperature:.2f}")
-            print(f"   ▸ AttnTemp    : {self.attn_scorer.temperature:.2f} | GatedTemp: {self.pooling.temperature:.2f}")
+            if phase < 1:
+                print("🎯 SupCon Sampling Strategy:")
+                print(f"   ▸ Max Pos            : {self.contrastive_loss_fn.max_pos}")
+                print(f"   ▸ Max Neg            : {self.contrastive_loss_fn.max_neg}")
+                print(f"   ▸ Pos/Neg Ratio      : {self.contrastive_loss_fn.pos_neg_ratio:.2f}")
+                print(f"   ▸ SupConTemperature  : {self.contrastive_loss_fn.temperature:.2f}")
+                print(f"   ▸ SoftmaxTemperature : {self.temperature:.2f}")
             print("-" * 80)
 
             tbar = tqdm(data_loader["train"], desc=f"Epoch {epoch}", ncols=80)
@@ -852,17 +779,21 @@ class TemporalBranchTrainer_BC(BaseTrainer):
             ce_total = 0.0
             contrastive_total = 0.0
             sparsity_total = 0.0
-            cos_total = 0.0
             chunk_ce_total = 0.0
             num_batches = len(tbar)
+            
+            # Clear t-SNE logging buffers (visualizing chunk/session embeddings per epoch)
+            self.chunk_embeddings_for_tsne.clear()
+            self.chunk_labels_for_tsne.clear()
+            self.session_embeddings_for_tsne.clear()
+            self.session_labels_for_tsne.clear()
 
             for idx, batch in enumerate(tbar):
                 (
-                    loss_total, ce_loss, contrastive_loss, sparsity_loss,
-                    cos_loss, chunk_ce_loss, _, preds, label_tensor,
-                    train_cos, train_chunk_ce,
-                    entropy_attn, entropy_gated  
-                ) = self.forward_batch(batch, epoch)
+                    loss_total, 
+                    ce_loss, contrastive_loss, sparsity_loss, chunk_ce_loss, 
+                    preds, label_tensor, train_chunk_ce, entropy_attn, entropy_gated  
+                ) = self.forward_batch(batch, epoch, phase)
 
                 self.optimizer.zero_grad()
                 loss_total.backward()
@@ -879,7 +810,6 @@ class TemporalBranchTrainer_BC(BaseTrainer):
                 ce_total += ce_loss.item()
                 contrastive_total += contrastive_loss.item()
                 sparsity_total += sparsity_loss.item()
-                cos_total += train_cos
                 chunk_ce_total += train_chunk_ce
 
                 # === GRADIENT CHECK ===
@@ -892,7 +822,6 @@ class TemporalBranchTrainer_BC(BaseTrainer):
                         ("GatedAttentionPooling", self.pooling),
                         ("Classifier", self.classifier),
                         ("ChunkAuxClassifier", self.chunk_aux_classifier),
-                        ("TopKPooler", self.topk_pooler),
                     ]
                     for name, module in modules:
                         for pname, param in module.named_parameters():
@@ -906,8 +835,8 @@ class TemporalBranchTrainer_BC(BaseTrainer):
             # === Entropy-aware loss scheduling (actual update) ===
             avg_entropy_attn = sum(entropy_attn_all) / len(entropy_attn_all)
             avg_entropy_gated = sum(entropy_gated_all) / len(entropy_gated_all)
-            self.update_loss_weights_by_epoch(epoch, avg_entropy_attn, avg_entropy_gated, apply_entropy_update=True)
-
+            self.avg_entropy_attn = avg_entropy_attn
+            
             # === Training summary ===
             avg_loss = running_loss / num_batches
             acc = accuracy_score(all_labels, all_preds)
@@ -915,7 +844,6 @@ class TemporalBranchTrainer_BC(BaseTrainer):
             self.loss_ce_per_epoch.append(ce_total / num_batches)
             self.loss_contrastive_per_epoch.append(contrastive_total / num_batches)
             self.loss_sparsity_per_epoch.append(sparsity_total / num_batches)
-            self.loss_cos_per_epoch.append(cos_total / num_batches)
             self.loss_chunk_ce_per_epoch.append(chunk_ce_total / num_batches)
 
             print(f"Epoch {epoch}: Train Loss = {avg_loss:.4f}, Acc = {acc:.4f}")
@@ -959,10 +887,6 @@ class TemporalBranchTrainer_BC(BaseTrainer):
                 self.best_train_loss = avg_loss
                 self.save_model(epoch=epoch, val_loss=val_loss, train_loss=avg_loss, val_metrics=metrics, tag="best_train_loss")
                 print(f"[SAVE] Best Train Loss model updated at epoch {epoch}")
-            if cos_loss > 0 and train_cos < self.best_cos_loss:
-                self.best_cos_loss = train_cos
-                self.save_model(epoch=epoch, val_loss=val_loss, train_loss=avg_loss, val_metrics=metrics, tag="best_cos")
-                print(f"[SAVE] Best KL loss model updated at epoch {epoch}")
             if chunk_ce_loss > 0 and train_chunk_ce < self.best_chunk_ce_loss:
                 self.best_chunk_ce_loss = train_chunk_ce
                 self.save_model(epoch=epoch, val_loss=val_loss, train_loss=avg_loss, val_metrics=metrics, tag="best_chunkce")
@@ -978,7 +902,6 @@ class TemporalBranchTrainer_BC(BaseTrainer):
                 "loss/train_ce": self.loss_ce_per_epoch[-1],
                 "loss/train_contrastive": self.loss_contrastive_per_epoch[-1],
                 "loss/train_sparsity": self.loss_sparsity_per_epoch[-1],
-                "loss/train_cos": self.loss_cos_per_epoch[-1],
                 "loss/train_chunk_ce": self.loss_chunk_ce_per_epoch[-1],
                 "acc/train": acc,
                 "loss/valid_total": val_loss,
@@ -989,7 +912,6 @@ class TemporalBranchTrainer_BC(BaseTrainer):
                 "lr": self.scheduler.get_last_lr()[0],
                 "epoch": epoch
             })
-
 
         # Final visualization
         self.plot_losses_and_lrs()
@@ -1063,7 +985,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
 
         base_name = self.config.TRAIN.MODEL_FILE_NAME
         tags = ["best_acc", "best_f1", "best_metric", "best_loss", 
-                "best_train_loss", "best_cos", "best_chunkce", "last_epoch"]
+                "best_train_loss", "best_chunkce", "last_epoch"]
         results = {}
 
         for tag in tags:
@@ -1233,7 +1155,6 @@ class TemporalBranchTrainer_BC(BaseTrainer):
         self.temporal_branch.train()
         self.attn_scorer.train()
         self.chunk_projection.train()
-        self.topk_pooler.train()
         self.chunk_aux_classifier.train()
         self.pooling.train()
         self.classifier.train()
@@ -1243,7 +1164,6 @@ class TemporalBranchTrainer_BC(BaseTrainer):
         self.temporal_branch.eval()
         self.attn_scorer.eval()
         self.chunk_projection.eval()
-        self.topk_pooler.eval()
         self.chunk_aux_classifier.eval()
         self.pooling.eval()
         self.classifier.eval()
