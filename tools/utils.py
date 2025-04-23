@@ -1,5 +1,6 @@
 import os
 import time
+import entmax
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -48,34 +49,36 @@ def reconstruct_sessions(self, batch=None, idx=None, epoch=None, phase="train"):
             self.chunk_labels_for_tsne.append(label)
 
         # === Attention ===
-        attn_scored, entropy_attn = self.attn_scorer(chunk_embeds, return_entropy=True)
-        sess_emb, attn_gated, entropy_gated = self.pooling(chunk_embeds, return_weights=True, return_entropy=True)
+        raw_scores = self.attn_scorer(chunk_embeds)  # (1, T, 1)
+        pooled, attn_weights, entropy = self.pooling(chunk_embeds, raw_scores, return_weights=True, return_entropy=True)
+        if epoch < 10: # Phase 0.0
+            attn_weights = F.softmax(raw_scores / self.temperature, dim=1)
+            entropy = -torch.sum(attn_weights * torch.log(attn_weights + 1e-8), dim=1).mean()
+        elif 10 <= epoch < 35: # Phase 0.5 and 1
+            attn_weights = entmax.entmax15(raw_scores, dim=1)
+            entropy = -torch.sum(attn_weights * torch.log(attn_weights + 1e-8), dim=1).mean()
+        else: # Phase 2
+            pass
 
         if phase in ['train', 'valid']:
-            if epoch < self.warm_up:
-                entropy = entropy_attn
-                attn_weights = attn_scored
+            if epoch <= 34:
                 attn_np = attn_weights.detach().cpu().squeeze().numpy()
                 print(f"[DEBUG][SupCon Attention Weights] {attn_np.tolist()}")
                 print(f"[DEBUG][SupCon Attn Sparsity] mean={attn_np.mean():.4f}, std={attn_np.std():.4f}, entropy={entropy.item():.4f}")
             else:
-                entropy = entropy_gated
-                attn_weights = attn_gated
                 attn_np = attn_weights.detach().cpu().squeeze().numpy()
                 print(f"[DEBUG][Gated Attention Weights] {attn_np.tolist()}")
                 print(f"[DEBUG][GatedAttn Sparsity] mean={attn_np.mean():.4f}, std={attn_np.std():.4f}, entropy={entropy.item():.4f}")
         else:
-            entropy = entropy_gated
-            attn_weights = attn_gated
             attn_np = attn_weights.detach().cpu().squeeze().numpy()
             print(f"[DEBUG][Gated Attention Weights] {attn_np.tolist()}")
             print(f"[DEBUG][GatedAttn Sparsity] mean={attn_np.mean():.4f}, std={attn_np.std():.4f}, entropy={entropy.item():.4f}")
 
         # for t-SNE
-        self.session_embeddings_for_tsne.append(sess_emb.detach().cpu().numpy())
+        self.session_embeddings_for_tsne.append(pooled.detach().cpu().numpy())
         self.session_labels_for_tsne.append(label)
 
-        session_embeddings[sess_id] = sess_emb
+        session_embeddings[sess_id] = pooled
         session_entropies[sess_id] = entropy
         session_labels[sess_id] = label
     

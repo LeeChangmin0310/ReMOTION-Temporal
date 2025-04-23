@@ -447,7 +447,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
             self.contrastive_weight = max(0.2, 1.0 - 0.8 * (epoch / PHASE0_END))
             self.chunk_ce_weight = 0.0
             self.ce_weight = 0.0
-            self.pooling.temperature = 0.7
+            self.temperature = 0.7
             if self.avg_entropy_attn is not None:
                 self.temperature = max(0.7, 1.2 - self.avg_entropy_attn)
             elif self.avg_entropy_attn is None:
@@ -629,32 +629,34 @@ class TemporalBranchTrainer_BC(BaseTrainer):
             all_labels_tensor.append(chunk_labels_tensor)
 
             # Step 1.7: Apply ChunkAuxClassifier on Top-K chunk embeds for discriminativity
-            if phase == 1:
-                attn = raw_scores.squeeze(0).squeeze(-1)
-                if len(attn) < 1:
-                    print("Something's Wrong..")
-                    continue
-                k = min(len(attn), int(len(attn) * self.top_k_ratio))
-                
-                selected_idx = torch.topk(attn, k=k).indices
-                topk_embeds = chunk_embeds[0][selected_idx]  # (K, D)
-                topk_logits = self.chunk_aux_classifier(topk_embeds)
-                topk_labels = torch.tensor([label] * len(topk_logits), dtype=torch.long, device=self.device)
-                loss_i = self.criterion(topk_logits, topk_labels)
-                chunk_ce_losses.append(loss_i)
-
+            attn = raw_scores.squeeze(0).squeeze(-1)
+            if len(attn) < 1:
+                print("Something's Wrong..")
+                continue
+            k = min(len(attn), int(len(attn) * self.top_k_ratio))
+            
+            selected_idx = torch.topk(attn, k=k).indices
+            topk_embeds = chunk_embeds[0][selected_idx]  # (K, D)
+            topk_logits = self.chunk_aux_classifier(topk_embeds)
+            topk_labels = torch.tensor([label] * len(topk_logits), dtype=torch.long, device=self.device)
+            loss_i = self.criterion(topk_logits, topk_labels)
+            chunk_ce_losses.append(loss_i)
+        
         # === Step 2: SupCon Loss ===
-        if phase == 0:
-            proj_concat = torch.cat(all_proj_embeddings, dim=0)
-            label_concat = torch.cat(all_labels_tensor, dim=0)
-            if label_concat.unique().numel() >= 2:
-                proj_norm = F.normalize(proj_concat, dim=-1)
-                print(f"[DEBUG] norm mean={proj_norm.mean().item():.4f}, std={proj_norm.std().item():.4f}")
-                contrastive_term = self.contrastive_loss_fn(proj_norm, label_concat)
-            else:
-                print("[Skip SupCon] Only one unique label in batch.")
-                contrastive_term = torch.tensor(0.0, device=self.device)
+        proj_concat = torch.cat(all_proj_embeddings, dim=0)
+        label_concat = torch.cat(all_labels_tensor, dim=0)
+        if label_concat.unique().numel() >= 2:
+            proj_norm = F.normalize(proj_concat, dim=-1)
+            print(f"[DEBUG] norm mean={proj_norm.mean().item():.4f}, std={proj_norm.std().item():.4f}")
+            contrastive_term = self.contrastive_loss_fn(proj_norm, label_concat)
+        else:
+            print("[Skip SupCon] Only one unique label in batch.")
+            contrastive_term = None
+        if contrastive_term is not None:
             contrastive_term_scaled = self.contrastive_weight * contrastive_term
+        else:
+            contrastive_term_scaled = torch.tensor(0.0, device=self.device)
+
 
         # === Step 3: Session-level CE Loss ===
         batch_embeds = torch.stack(session_embeds, dim=0)
@@ -662,30 +664,28 @@ class TemporalBranchTrainer_BC(BaseTrainer):
         outputs = self.classifier(batch_embeds)
         ce_loss = self.criterion(outputs, label_tensor)
         ce_loss_scaled = self.ce_weight * ce_loss
+        preds = torch.argmax(outputs, dim=1)
 
         # === Step 4: Sparsity Loss (for debugging) ===
         sparsity_loss = torch.stack(entropy_list).mean()
         sparsity_loss_scaled = sparsity_loss
 
-        # === Step 7: Total Loss Composition ===
+        # === Step 5: Chunk-level CE Loss ===
+        chunk_ce_loss = torch.stack(chunk_ce_losses).mean() if len(chunk_ce_losses) > 0 else torch.tensor(0.0, device=self.device)
+        chunk_ce_loss_scaled = self.chunk_ce_weight * chunk_ce_loss
+        
+        # === Step 6: Total Loss Composition ===
         if phase == 0:
-            chunk_ce_loss = torch.tensor(0.0, device=self.device)
-            chunk_ce_loss_scaled = torch.tensor(0.0, device=self.device)
-            loss_total = contrastive_term_scaled
+            if contrastive_term is not None:
+                loss_total = contrastive_term_scaled
+            else:
+                print("⚠️ Skipping backward for contrastive (no positive pairs)")
+                return None
         elif phase == 1:
-            # === Step 6: Chunk-level CE Loss ===
-            contrastive_term = torch.tensor(0.0, device=self.device)
-            contrastive_term_scaled = torch.tensor(0.0, device=self.device)
-            chunk_ce_loss = torch.stack(chunk_ce_losses).mean() if len(chunk_ce_losses) > 0 else torch.tensor(0.0, device=self.device)
-            chunk_ce_loss_scaled = self.chunk_ce_weight * chunk_ce_loss
             loss_total = chunk_ce_loss_scaled
         else:
-            chunk_ce_loss = torch.tensor(0.0, device=self.device)
-            chunk_ce_loss_scaled = torch.tensor(0.0, device=self.device)
             loss_total = ce_loss_scaled
 
-        preds = torch.argmax(outputs, dim=1)
-        
         # --- for adaptive temperature scheduling ---
         entropy_attn_mean = torch.stack(entropy_attn_list).mean() if len(entropy_attn_list) > 0 else torch.tensor(0.0, device=self.device)
         entropy_gated_mean = torch.stack(entropy_gated_list).mean() if len(entropy_gated_list) > 0 else torch.tensor(0.0, device=self.device)
@@ -702,6 +702,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
         print(f"   ▶ Total Loss : {loss_total.item():.4f}")
         print("─" * 60)
 
+
         # --- Optional Prediction Logging ---
         probs = torch.softmax(outputs, dim=1)
         print("\n🔎 [Batch Predictions]")
@@ -712,7 +713,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
             confidence = prob[pred]
             print(f"   ▸ Session {batch_session_ids[i]} | GT: {gt} | Pred: {pred} | Conf: {confidence:.4f} | Prob: {np.round(prob, 4)}")
         print("═" * 60)
-
+        
         return (
             loss_total, ce_loss, # Full loss for backward
             contrastive_term_scaled, sparsity_loss_scaled, chunk_ce_loss_scaled, # For raw monitoring (Already scaled)
@@ -795,11 +796,15 @@ class TemporalBranchTrainer_BC(BaseTrainer):
             self.session_labels_for_tsne.clear()
 
             for idx, batch in enumerate(tbar):
+                out = self.forward_batch(batch, epoch, phase)
+                if out is None:
+                    print(f"[SKIP] Batch {idx} skipped due to lack of contrastive labels")
+                    continue
                 (
                     loss_total, 
                     ce_loss, contrastive_loss, sparsity_loss, chunk_ce_loss, 
                     preds, label_tensor, train_chunk_ce, entropy_attn, entropy_gated  
-                ) = self.forward_batch(batch, epoch, phase)
+                ) = out
 
                 self.optimizer.zero_grad()
                 loss_total.backward()
@@ -825,9 +830,9 @@ class TemporalBranchTrainer_BC(BaseTrainer):
                         ("Temporal", self.temporal_branch),
                         ("AttentionScorer", self.attn_scorer),
                         ("Projection", self.chunk_projection),
+                        ("ChunkAuxClassifier", self.chunk_aux_classifier),
                         ("GatedAttentionPooling", self.pooling),
                         ("Classifier", self.classifier),
-                        ("ChunkAuxClassifier", self.chunk_aux_classifier),
                     ]
                     for name, module in modules:
                         for pname, param in module.named_parameters():
