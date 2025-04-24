@@ -49,7 +49,7 @@ def reconstruct_sessions(self, batch=None, idx=None, epoch=None, phase="train"):
             self.chunk_labels_for_tsne.append(label)
 
         # === Attention ===
-        raw_scores = self.attn_scorer(chunk_embeds)  # (1, T, 1)
+        _, raw_scores = self.attn_scorer(chunk_embeds)  # (1, T, 1)
         pooled, attn_weights, entropy = self.pooling(chunk_embeds, raw_scores, return_weights=True, return_entropy=True)
         if epoch < 10: # Phase 0.0
             attn_weights = F.softmax(raw_scores / self.temperature, dim=1)
@@ -231,10 +231,6 @@ class SupConLossTopK(nn.Module):
         """
         Dynamically update contrastive sampling strategy based on training phase.
         # Scheduling parameters for balance and curriculum
-        self.max_pos = min(8, 4 + epoch // 10)  # gradually grow until max 8
-        self.max_neg = min(40, 24 + epoch // 5)  # slightly slower growth up to 40
-        self.pos_neg_ratio = max(0.3, 1.0 - (epoch / max_epoch) * 0.7)  # from 1.0 → 0.3
-        self.threshold = 0.005 + (0.05 - 0.005) * (epoch / max_epoch)
         """
         # Phase 1: Warm-up (0 ~ 19)
         if epoch < 20:

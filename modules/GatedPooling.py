@@ -51,8 +51,8 @@ class GatedPooling(nn.Module):
             attn_weights (optional): (B, T, 1)
             entropy (optional): scalar entropy term
         """
-        attn_weights = entmax.entmax15(attn_scores, dim=1)  # (B, T, 1)
-        # attn_weights = F.softmax(attn_scores, dim=1)  # (B, T, 1)
+        # attn_weights = entmax.entmax15(attn_scores, dim=1)  # (B, T, 1)
+        attn_weights = F.softmax(attn_scores, dim=1)  # (B, T, 1)
 
         gate = self.gate(x)          # (B, T, D)
         gated_x = x * gate           # (B, T, D)

@@ -276,7 +276,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
         
         wandb.init(
             project="TemporalReMOTION",
-            name=f"Exp_{self.config.TRAIN.MODEL_FILE_NAME}_Final",
+            name=f"Exp_{self.config.TRAIN.MODEL_FILE_NAME}_Final_NoEntmax",
             # config=cfg_dict,
             dir="./wandb_logs"
         )
@@ -447,12 +447,10 @@ class TemporalBranchTrainer_BC(BaseTrainer):
             self.contrastive_weight = max(0.2, 1.0 - 0.8 * (epoch / PHASE0_END))
             self.chunk_ce_weight = 0.0
             self.ce_weight = 0.0
-            self.temperature = 0.7
+            self.temperature = 1.0
             if self.avg_entropy_attn is not None:
-                self.temperature = max(0.7, 1.2 - self.avg_entropy_attn)
+                self.temperature = max(1.0, 2.7 - self.avg_entropy_attn)
             elif self.avg_entropy_attn is None:
-                self.temperatur = 0.7
-            else:
                 self.temperature = 1.0
 
         elif epoch <= PHASE1_END:
@@ -578,24 +576,20 @@ class TemporalBranchTrainer_BC(BaseTrainer):
                 self.chunk_labels_for_tsne.append(label)
 
             # Step 1.3: Compute attention weights
-            raw_scores = self.attn_scorer(chunk_embeds)  # (1, T, 1)
+            attn_weights, raw_scores = self.attn_scorer(chunk_embeds, temperature=self.temperature, epoch=epoch)  # (1, T, 1)
             
             # Step 1.4: Gated pooling for session-level CE
-            pooled, attn_weights, entropy = self.pooling(chunk_embeds, raw_scores, return_weights=True, return_entropy=True)
+            pooled, attn_gated, entropy_gated = self.pooling(chunk_embeds, raw_scores, return_weights=True, return_entropy=True)
             
-            if epoch < 10: # Phase 0.0
-                attn_weights = F.softmax(raw_scores / self.temperature, dim=1)
-            elif 10 <= epoch < 35: # Phase 0.5 and 1
-                attn_weights = entmax.entmax15(raw_scores, dim=1)
-            else: # Phase 2
-                pass
+            if phase == 2: # Phase 2
+                attn_weights = attn_gated
 
             # Entropies for adaptive temperature adjusting and debugging
             if phase < 2:
                 entropy = -torch.sum(attn_weights * torch.log(attn_weights + 1e-8), dim=1).mean()
-                entropy_attn_list.append(entropy.detach())
+                entropy_attn_list.append(entropy)
             else:
-                entropy_gated_list.append(entropy.detach())
+                entropy_gated_list.append(entropy_gated.detach())
             
             session_embeds.append(pooled.squeeze(0))
             target_labels.append(label)
@@ -606,9 +600,9 @@ class TemporalBranchTrainer_BC(BaseTrainer):
 
             # Step 1.5: Sparsity regularization loss
             if phase < 2:
-                entropy_attn_list.append(entropy.detach())
+                entropy_attn_list.append(entropy)
             else:
-                entropy_gated_list.append(entropy.detach())
+                entropy_gated_list.append(entropy)
             entropy_list.append(entropy)
             
             # --- DEBUG: Attention Information ---
@@ -643,19 +637,24 @@ class TemporalBranchTrainer_BC(BaseTrainer):
             chunk_ce_losses.append(loss_i)
         
         # === Step 2: SupCon Loss ===
-        proj_concat = torch.cat(all_proj_embeddings, dim=0)
-        label_concat = torch.cat(all_labels_tensor, dim=0)
-        if label_concat.unique().numel() >= 2:
-            proj_norm = F.normalize(proj_concat, dim=-1)
-            print(f"[DEBUG] norm mean={proj_norm.mean().item():.4f}, std={proj_norm.std().item():.4f}")
-            contrastive_term = self.contrastive_loss_fn(proj_norm, label_concat)
-        else:
-            print("[Skip SupCon] Only one unique label in batch.")
-            contrastive_term = None
-        if contrastive_term is not None:
+        if len(all_proj_embeddings) == 0:
+            print("[Skip SupCon] No valid projected chunks selected for contrastive loss.")
+            contrastive_term = torch.tensor(0.0, device=self.device)
             contrastive_term_scaled = self.contrastive_weight * contrastive_term
         else:
-            contrastive_term_scaled = torch.tensor(0.0, device=self.device)
+            proj_concat = torch.cat(all_proj_embeddings, dim=0)
+            label_concat = torch.cat(all_labels_tensor, dim=0)
+            if label_concat.unique().numel() >= 2:
+                proj_norm = F.normalize(proj_concat, dim=-1)
+                print(f"[DEBUG] norm mean={proj_norm.mean().item():.4f}, std={proj_norm.std().item():.4f}")
+                contrastive_term = self.contrastive_loss_fn(proj_norm, label_concat)
+            else:
+                print("[Skip SupCon] Only one unique label in batch.")
+                contrastive_term = None
+            if contrastive_term is not None:
+                contrastive_term_scaled = self.contrastive_weight * contrastive_term
+            else:
+                contrastive_term_scaled = torch.tensor(0.0, device=self.device)
 
 
         # === Step 3: Session-level CE Loss ===
@@ -668,7 +667,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
 
         # === Step 4: Sparsity Loss (for debugging) ===
         sparsity_loss = torch.stack(entropy_list).mean()
-        sparsity_loss_scaled = sparsity_loss
+        sparsity_loss_scaled = sparsity_loss * 0.3
 
         # === Step 5: Chunk-level CE Loss ===
         chunk_ce_loss = torch.stack(chunk_ce_losses).mean() if len(chunk_ce_losses) > 0 else torch.tensor(0.0, device=self.device)
@@ -677,7 +676,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
         # === Step 6: Total Loss Composition ===
         if phase == 0:
             if contrastive_term is not None:
-                loss_total = contrastive_term_scaled
+                loss_total = contrastive_term_scaled + sparsity_loss_scaled
             else:
                 print("⚠️ Skipping backward for contrastive (no positive pairs)")
                 return None
@@ -698,7 +697,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
         print(f"   ▸ Contrastive: {contrastive_term.item():.4f} × {self.contrastive_weight:.2f} = {contrastive_term_scaled.item():.4f}")
         print(f"   ▸ Chunk CE   : {chunk_ce_loss.item():.4f} x {self.ce_weight:.2f} = {ce_loss_scaled.item():.4f}")
         print(f"   ▸ Entropy    : Scorer = {entropy_attn_mean:.4f}, Gated = {entropy_gated_mean:.4f}")
-        print(f"   ▸ Sparsity   : {sparsity_loss.item():.4f}")
+        print(f"   ▸ Sparsity   : {sparsity_loss.item():.4f} x 0.3 = {sparsity_loss_scaled.item():.4f}")
         print(f"   ▶ Total Loss : {loss_total.item():.4f}")
         print("─" * 60)
 
