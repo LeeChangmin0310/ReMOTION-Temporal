@@ -139,6 +139,19 @@ def run_tsne_and_plot(self, level="chunk", epoch=0, phase="train"):
         self.session_embeddings_for_tsne.clear()
         self.session_labels_for_tsne.clear()
 
+# --- Utility
+def straight_through_topk(scores, k):
+    """
+    Forward  : hard Top-K mask
+    Backward : softmax(scores/τ) 로 그대로 gradient 전달
+    scores : (B, T, 1)
+    returns : alpha_st  (B, T, 1)
+    """
+    probs = F.softmax(scores, dim=1)         # (B,T,1)
+    top_val, top_idx = torch.topk(probs, k=k, dim=1)
+    hard = torch.zeros_like(probs).scatter_(1, top_idx, 1.0)
+    return (hard - probs).detach() + probs      # ST(straight-through)-trick
+
 
 # --- Utility functions for supervised contrastive loss with top-k attention-based chunk selection ---
 class SupConLossTopK(nn.Module):

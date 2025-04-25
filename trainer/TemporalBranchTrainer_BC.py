@@ -276,7 +276,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
         
         wandb.init(
             project="TemporalReMOTION",
-            name=f"Exp_{self.config.TRAIN.MODEL_FILE_NAME}_Final_NoEntmax",
+            name=f"Exp_{self.config.TRAIN.MODEL_FILE_NAME}_Final_NoEntmax_graddebug",
             # config=cfg_dict,
             dir="./wandb_logs"
         )
@@ -513,213 +513,175 @@ class TemporalBranchTrainer_BC(BaseTrainer):
         # self.scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(self.optimizer, T_0=10, T_mult=2, eta_min=1e-6)
 
     
+    # ----------------------------------------------------------
+    # helper (already imported in your module header once)
+    # from utils.attention_utils import straight_through_topk
+    # ----------------------------------------------------------
+
     def forward_batch(self, batch, epoch, phase):
-        """
-        Forward function for one training batch (B sessions) during epoch `epoch`.
-
-        Handles phase-wise:
-        - Phase 0: SupConLossTopK + adaptive temperature
-        - Phase 1: Chunk-level CE with Top-K + threshold
-        - Phase 2: Session-level CE with GatedPooling
-        
-        Handles:
-        - TemporalBranch → chunk-wise rPPG embeddings
-        - AttnScorer: pre-softmax raw score
-        - SupConLossTopK with Top-K + threshold selection from epoch ≥ 20
-        - GatedPooling for CE loss
-        - ChunkAuxClassifier (epoch 20–34 only) for chunk-level CE supervision
-        - SparsityLoss based on entropy: AttnScorer vs Gated
-        - t-SNE logging for chunk/session visualization
-        - Full debug printouts for embeddings, attention, entropy, losses
-        
-        Additional:
-        - t-SNE logging
-        - Attention entropy debug
-        - Full loss composition & debug prints
-        """
-
-        chunk_tensors, batch_labels, batch_session_ids, _ = batch
+        """One mini-batch forward pass (B sessions)."""
+        chunk_tensors, batch_labels, batch_sids, _ = batch
         B = len(batch_labels)
 
-        # === Step 0: Initialization ===
+        # ───── collectors ────────────────────────────────────
         session_embeds, target_labels = [], []
-        all_proj_embeddings, all_labels_tensor, all_attn_weights = [], [], []
-        chunk_ce_losses, entropy_list = [], []  # Per-session chunk-level CE loss and entropy debugging
+        proj_for_supcon, labels_for_supcon = [], []
+        chunk_ce_losses, entropy_list = [], []
         entropy_attn_list, entropy_gated_list = [], []
+        # -----------------------------------------------------
 
-        # === Step 1: Iterate each session in batch ===
-        for i in range(B):
-            chunks = chunk_tensors[i]  # (T, 1, 128)
-            label = batch_labels[i]
-            sess_id = batch_session_ids[i]
-            num_chunks = chunks.shape[0]
-            chunk_embeds, chunk_proj_embeds = [], []
+        # ───── per-session loop ──────────────────────────────
+        for b in range(B):
+            chunks = chunk_tensors[b].float().to(self.device)      # (T,1,128)
+            T      = chunks.size(0)
+            label  = batch_labels[b]
+            sid    = batch_sids[b]
 
-            print(f"[DEBUG] Session {sess_id} -> #chunks = {num_chunks}")
+            print(f"[DEBUG] Session {sid}  #chunks={T}")
 
-            # Step 1.1: Extract embeddings for each chunk
-            for j in range(num_chunks):
-                chunk_data = chunks[j].unsqueeze(0).float().to(self.device)
-                emb = self.forward_single_chunk_checkpoint(chunk_data)  # (1, D)
-                proj = self.chunk_projection(emb)  # (1, D)
-                chunk_embeds.append(emb)
-                chunk_proj_embeds.append(proj)
+            # 1) encode all chunks at once  (T,1,128) ➜ (1,T,D)
+            chunk_emb = self.forward_single_chunk_checkpoint(chunks)  # (T,D)
+            chunk_emb = chunk_emb.unsqueeze(0)                        # (1,T,D)
 
-            chunk_embeds = torch.cat(chunk_embeds, dim=0).unsqueeze(0)  # (1, T, D)
-            chunk_proj_embeds = torch.cat(chunk_proj_embeds, dim=0)    # (T, D)
-            chunk_labels_tensor = torch.tensor([label] * num_chunks, dtype=torch.long, device=self.device)
+            # 2) attention scorer
+            attn_soft, raw_scores = self.attn_scorer(chunk_emb)       # (1,T,1)
 
-            # Step 1.2: t-SNE logging for visualization
-            for i, cemb in enumerate(chunk_embeds[0]):
-                print(f"  Chunk {i}: mean={cemb.mean().item():.4f}, std={cemb.std().item():.4f}")
-                self.chunk_embeddings_for_tsne.append(cemb.detach().cpu().numpy())
-                self.chunk_labels_for_tsne.append(label)
+            # 3) build α  – soft in Phase-0, ST-Top-K in Phase-1
+            if epoch < 20:                                            # Phase-0
+                alpha = attn_soft
+            else:                                                     # Phase-1
+                k = max(6, int(T * self.top_k_ratio))
+                alpha = straight_through_topk(raw_scores, k, tau=0.7)
 
-            # Step 1.3: Compute attention weights
-            attn_weights, raw_scores = self.attn_scorer(chunk_embeds, temperature=self.temperature, epoch=epoch)  # (1, T, 1)
-            
-            # Step 1.4: Gated pooling for session-level CE
-            pooled, attn_gated, entropy_gated = self.pooling(chunk_embeds, raw_scores, return_weights=True, return_entropy=True)
-            
-            if phase == 2: # Phase 2
-                attn_weights = attn_gated
+            # 4) apply α before projection  (keeps grad path)
+            gated_emb   = chunk_emb * alpha                           # (1,T,D)
+            proj_embeds = self.chunk_projection(gated_emb)            # (1,T,128)
 
-            # Entropies for adaptive temperature adjusting and debugging
-            if phase < 2:
-                entropy = -torch.sum(attn_weights * torch.log(attn_weights + 1e-8), dim=1).mean()
-                entropy_attn_list.append(entropy)
-            else:
-                entropy_gated_list.append(entropy_gated.detach())
-            
+            # 5-A) SupCon collection
+            if phase < 1:
+                proj_for_supcon.append(proj_embeds.squeeze(0))
+                labels_for_supcon.append(torch.full((T,), label,
+                                    dtype=torch.long, device=self.device))
+
+            # 5-B) Top-K chunk CE  (Phase-1)
+            if phase == 1:
+                mask_bool = alpha.squeeze(0).bool()                   # (T,)
+                topk_emb  = chunk_emb.squeeze(0)[mask_bool]           # (K,D)
+                topk_logits = self.chunk_aux_classifier(topk_emb)
+                topk_labels = torch.full((len(topk_logits),), label,
+                                        dtype=torch.long, device=self.device)
+                chunk_ce_losses.append(self.criterion(topk_logits, topk_labels))
+
+            # 6) session-level pooling
+            pooled, attn_gated, ent_gated = self.pooling(
+                gated_emb, raw_scores, return_weights=True, return_entropy=True)
+
             session_embeds.append(pooled.squeeze(0))
             target_labels.append(label)
-            
-            # --- For session-level t-SNE plot --- 
-            self.session_embeddings_for_tsne.append(pooled.squeeze(0).detach().cpu().numpy())
-            self.session_labels_for_tsne.append(label)
 
-            # Step 1.5: Sparsity regularization loss
-            if phase < 2:
-                entropy_attn_list.append(entropy)
-            else:
-                entropy_gated_list.append(entropy)
-            entropy_list.append(entropy)
-            
-            # --- DEBUG: Attention Information ---
-            if phase < 2:
-                attn_np = attn_weights.detach().cpu().squeeze().numpy()
-                print(f"[DEBUG][Attn Weights] {attn_np.tolist()}")
-                print(f"[DEBUG][Attn Sparsity] mean={attn_np.mean():.4f}, std={attn_np.std():.4f}, entropy={entropy.item():.4f}")
-            else:
-                gated_np = attn_weights.detach().cpu().squeeze().numpy()
-                print(f"[DEBUG][Gated Attn Weights] {gated_np.tolist()}")
-                print(f"[DEBUG][Gated Attn Sparsity] mean={gated_np.mean():.4f}, std={gated_np.std():.4f}, entropy={entropy.item():.4f}")
-            
-            # Step 1.6: Store contrastive info (projection + attention)
-            if phase < 1:
-                weighted_proj = attn_weights.squeeze(0) * chunk_proj_embeds
-                all_proj_embeddings.append(weighted_proj)
-                all_attn_weights.append(attn_weights.view(-1))
-            all_labels_tensor.append(chunk_labels_tensor)
+            # 7) entropy bookkeeping
+            entropy_attn = -(alpha * alpha.clamp_min(1e-8).log()).sum(dim=1).mean()
+            entropy_attn_list.append(entropy_attn)
+            entropy_gated_list.append(ent_gated)
+            entropy_list.append(entropy_attn if phase < 2 else ent_gated)
 
-            # Step 1.7: Apply ChunkAuxClassifier on Top-K chunk embeds for discriminativity
-            attn = raw_scores.squeeze(0).squeeze(-1)
-            if len(attn) < 1:
-                print("Something's Wrong..")
-                continue
-            k = min(len(attn), int(len(attn) * self.top_k_ratio))
-            
-            selected_idx = torch.topk(attn, k=k).indices
-            topk_embeds = chunk_embeds[0][selected_idx]  # (K, D)
-            topk_logits = self.chunk_aux_classifier(topk_embeds)
-            topk_labels = torch.tensor([label] * len(topk_logits), dtype=torch.long, device=self.device)
-            loss_i = self.criterion(topk_logits, topk_labels)
-            chunk_ce_losses.append(loss_i)
-        
-        # === Step 2: SupCon Loss ===
-        if len(all_proj_embeddings) == 0:
-            print("[Skip SupCon] No valid projected chunks selected for contrastive loss.")
-            contrastive_term = torch.tensor(0.0, device=self.device)
-            contrastive_term_scaled = self.contrastive_weight * contrastive_term
-        else:
-            proj_concat = torch.cat(all_proj_embeddings, dim=0)
-            label_concat = torch.cat(all_labels_tensor, dim=0)
+            # 8) OPTIONAL chunk-level debug
+            if phase < 2:
+                print(f"[DEBUG][Attn] mean={alpha.mean():.3f} "
+                    f"std={alpha.std():.3f} ent={entropy_attn.item():.3f}")
+
+        # ───── phase-specific losses ─────────────────────────
+        # SupCon (Phase-0)
+        if phase < 1 and proj_for_supcon:
+            proj_concat  = torch.cat(proj_for_supcon, 0)
+            label_concat = torch.cat(labels_for_supcon, 0)
             if label_concat.unique().numel() >= 2:
-                proj_norm = F.normalize(proj_concat, dim=-1)
-                print(f"[DEBUG] norm mean={proj_norm.mean().item():.4f}, std={proj_norm.std().item():.4f}")
-                contrastive_term = self.contrastive_loss_fn(proj_norm, label_concat)
+                contrastive_term = self.contrastive_loss_fn(proj_concat, label_concat)
             else:
-                print("[Skip SupCon] Only one unique label in batch.")
                 contrastive_term = None
-            if contrastive_term is not None:
-                contrastive_term_scaled = self.contrastive_weight * contrastive_term
-            else:
-                contrastive_term_scaled = torch.tensor(0.0, device=self.device)
+        else:
+            contrastive_term = None
 
+        # Session CE (always computed)
+        sess_mat   = torch.stack(session_embeds, 0)
+        label_vec  = torch.tensor(target_labels, dtype=torch.long, device=self.device)
+        ce_logits  = self.classifier(sess_mat)
+        ce_loss    = self.criterion(ce_logits, label_vec)
 
-        # === Step 3: Session-level CE Loss ===
-        batch_embeds = torch.stack(session_embeds, dim=0)
-        label_tensor = torch.tensor(target_labels, dtype=torch.long, device=self.device)
-        outputs = self.classifier(batch_embeds)
-        ce_loss = self.criterion(outputs, label_tensor)
-        ce_loss_scaled = self.ce_weight * ce_loss
-        preds = torch.argmax(outputs, dim=1)
+        # Chunk CE (Phase-1)
+        chunk_ce_raw = (torch.stack(chunk_ce_losses).mean()
+                        if chunk_ce_losses else torch.tensor(0.0, device=self.device))
 
-        # === Step 4: Sparsity Loss (for debugging) ===
+        # Sparsity (for monitoring)
         sparsity_loss = torch.stack(entropy_list).mean()
-        sparsity_loss_scaled = sparsity_loss * 0.3
 
-        # === Step 5: Chunk-level CE Loss ===
-        chunk_ce_loss = torch.stack(chunk_ce_losses).mean() if len(chunk_ce_losses) > 0 else torch.tensor(0.0, device=self.device)
-        chunk_ce_loss_scaled = self.chunk_ce_weight * chunk_ce_loss
-        
-        # === Step 6: Total Loss Composition ===
+        # ───── scaled terms (for debug table) ───────────────
+        ce_loss_scaled          = self.ce_weight      * ce_loss
+        contrastive_term_scaled = (self.contrastive_weight * contrastive_term
+                                if contrastive_term is not None
+                                else torch.tensor(0.0, device=self.device))
+        chunk_ce_loss_scaled    = self.chunk_ce_weight * chunk_ce_raw
+
+        # ───── total loss per phase ─────────────────────────
         if phase == 0:
-            if contrastive_term is not None:
-                loss_total = contrastive_term_scaled + sparsity_loss_scaled
-            else:
-                print("⚠️ Skipping backward for contrastive (no positive pairs)")
+            if contrastive_term is None:
+                print("⚠️  Skip batch (no positive pairs)")
                 return None
+            loss_total = contrastive_term_scaled
         elif phase == 1:
             loss_total = chunk_ce_loss_scaled
-        else:
+        else:                              # phase 2
             loss_total = ce_loss_scaled
+        # ----------------------------------------------------
 
-        # --- for adaptive temperature scheduling ---
-        entropy_attn_mean = torch.stack(entropy_attn_list).mean() if len(entropy_attn_list) > 0 else torch.tensor(0.0, device=self.device)
-        entropy_gated_mean = torch.stack(entropy_gated_list).mean() if len(entropy_gated_list) > 0 else torch.tensor(0.0, device=self.device)
-
+        # ───── FULL DEBUG PRINT (unchanged layout) ──────────
         print("\n📊 [Loss Breakdown & Prediction]")
         print("─" * 60)
-        print(f"🔧 Loss Weights:\n   ▸ CE         : {self.ce_weight:.2f}\n   ▸ Contrastive: {self.contrastive_weight:.2f}\n    ▸ ChunkCE    : {self.chunk_ce_weight:.2f}")
-        print("\n📉 Loss Components (PHASE {phase}):")
-        print(f"   ▸ CE         : {ce_loss.item():.4f} × {self.ce_weight:.2f} = {ce_loss_scaled.item():.4f}")
-        print(f"   ▸ Contrastive: {contrastive_term.item():.4f} × {self.contrastive_weight:.2f} = {contrastive_term_scaled.item():.4f}")
-        print(f"   ▸ Chunk CE   : {chunk_ce_loss.item():.4f} x {self.ce_weight:.2f} = {ce_loss_scaled.item():.4f}")
-        print(f"   ▸ Entropy    : Scorer = {entropy_attn_mean:.4f}, Gated = {entropy_gated_mean:.4f}")
-        print(f"   ▸ Sparsity   : {sparsity_loss.item():.4f} x 0.3 = {sparsity_loss_scaled.item():.4f}")
+        print(f"🔧 Loss Weights:\n   ▸ CE         : {self.ce_weight:.2f}"
+            f"\n   ▸ Contrastive: {self.contrastive_weight:.2f}"
+            f"\n   ▸ ChunkCE    : {self.chunk_ce_weight:.2f}")
+        print(f"\n📉 Loss Components (PHASE {phase}):")
+        print(f"   ▸ CE         : {ce_loss.item():.4f} × {self.ce_weight:.2f}"
+            f" = {ce_loss_scaled.item():.4f}")
+        print(f"   ▸ Contrastive: "
+            f"{(contrastive_term or torch.tensor(0)).item():.4f} × "
+            f"{self.contrastive_weight:.2f} = "
+            f"{contrastive_term_scaled.item():.4f}")
+        print(f"   ▸ Chunk CE   : {chunk_ce_raw.item():.4f} × "
+            f"{self.chunk_ce_weight:.2f} = "
+            f"{chunk_ce_loss_scaled.item():.4f}")
+        entropy_attn_mean  = torch.stack(entropy_attn_list).mean()
+        entropy_gated_mean = torch.stack(entropy_gated_list).mean()
+        print(f"   ▸ Entropy    : Scorer = {entropy_attn_mean:.4f}, "
+            f"Gated = {entropy_gated_mean:.4f}")
+        print(f"   ▸ Sparsity   : {sparsity_loss.item():.4f}")
         print(f"   ▶ Total Loss : {loss_total.item():.4f}")
         print("─" * 60)
 
-
-        # --- Optional Prediction Logging ---
-        probs = torch.softmax(outputs, dim=1)
-        print("\n🔎 [Batch Predictions]")
-        for i in range(len(label_tensor)):
-            gt = label_tensor[i].item()
-            prob = probs[i].detach().cpu().numpy()
-            pred = np.argmax(prob)
-            confidence = prob[pred]
-            print(f"   ▸ Session {batch_session_ids[i]} | GT: {gt} | Pred: {pred} | Conf: {confidence:.4f} | Prob: {np.round(prob, 4)}")
+        # ───── prediction list (unchanged) ─────────────────
+        probs = torch.softmax(ce_logits, 1)
+        for idx in range(len(label_vec)):
+            prob_np = probs[idx].detach().cpu().numpy()
+            pred    = prob_np.argmax()
+            print(f"   ▸ Session {batch_sids[idx]} | GT: {label_vec[idx].item()} "
+                f"| Pred: {pred} | Conf: {prob_np[pred]:.4f} "
+                f"| Prob: {np.round(prob_np,4)}")
         print("═" * 60)
-        
+
+        # ───── return (original order) ─────────────────────
         return (
-            loss_total, ce_loss, # Full loss for backward
-            contrastive_term_scaled, sparsity_loss_scaled, chunk_ce_loss_scaled, # For raw monitoring (Already scaled)
-            preds, label_tensor,
-            chunk_ce_loss.item(), # For best model check
-            entropy_attn_mean, entropy_gated_mean
+            loss_total,
+            ce_loss,
+            contrastive_term_scaled,
+            0.3 * sparsity_loss,      # sparsity_scaled kept for compatibility
+            chunk_ce_loss_scaled,
+            torch.argmax(ce_logits, 1),
+            label_vec,
+            chunk_ce_raw.item(),
+            entropy_attn_mean,
+            entropy_gated_mean
         )
+
 
     def train(self, data_loader):
         """
@@ -1179,6 +1141,209 @@ class TemporalBranchTrainer_BC(BaseTrainer):
         self.classifier.eval()
 
     """
+        def forward_batch(self, batch, epoch, phase):
+        """
+        Forward function for one training batch (B sessions) during epoch `epoch`.
+
+        Handles phase-wise:
+        - Phase 0: SupConLossTopK + adaptive temperature
+        - Phase 1: Chunk-level CE with Top-K + threshold
+        - Phase 2: Session-level CE with GatedPooling
+        
+        Handles:
+        - TemporalBranch → chunk-wise rPPG embeddings
+        - AttnScorer: pre-softmax raw score
+        - SupConLossTopK with Top-K + threshold selection from epoch ≥ 20
+        - GatedPooling for CE loss
+        - ChunkAuxClassifier (epoch 20–34 only) for chunk-level CE supervision
+        - SparsityLoss based on entropy: AttnScorer vs Gated
+        - t-SNE logging for chunk/session visualization
+        - Full debug printouts for embeddings, attention, entropy, losses
+        
+        Additional:
+        - t-SNE logging
+        - Attention entropy debug
+        - Full loss composition & debug prints
+        """
+
+        chunk_tensors, batch_labels, batch_session_ids, _ = batch
+        B = len(batch_labels)
+
+        # === Step 0: Initialization ===
+        session_embeds, target_labels = [], []
+        all_proj_embeddings, all_labels_tensor, all_attn_weights = [], [], []
+        chunk_ce_losses, entropy_list = [], []  # Per-session chunk-level CE loss and entropy debugging
+        entropy_attn_list, entropy_gated_list = [], []
+
+        # === Step 1: Iterate each session in batch ===
+        for i in range(B):
+            chunks = chunk_tensors[i]  # (T, 1, 128)
+            label = batch_labels[i]
+            sess_id = batch_session_ids[i]
+            num_chunks = chunks.shape[0]
+            chunk_embeds, chunk_proj_embeds = [], []
+
+            print(f"[DEBUG] Session {sess_id} -> #chunks = {num_chunks}")
+
+            # Step 1.1: Extract embeddings for each chunk
+            for j in range(num_chunks):
+                chunk_data = chunks[j].unsqueeze(0).float().to(self.device)
+                emb = self.forward_single_chunk_checkpoint(chunk_data)  # (1, D)
+                proj = self.chunk_projection(emb)  # (1, D)
+                chunk_embeds.append(emb)
+                chunk_proj_embeds.append(proj)
+
+            chunk_embeds = torch.cat(chunk_embeds, dim=0).unsqueeze(0)  # (1, T, D)
+            chunk_proj_embeds = torch.cat(chunk_proj_embeds, dim=0)    # (T, D)
+            chunk_labels_tensor = torch.tensor([label] * num_chunks, dtype=torch.long, device=self.device)          
+
+            # Step 1.2: t-SNE logging for visualization
+            for i, cemb in enumerate(chunk_embeds[0]):
+                print(f"  Chunk {i}: mean={cemb.mean().item():.4f}, std={cemb.std().item():.4f}")
+                self.chunk_embeddings_for_tsne.append(cemb.detach().cpu().numpy())
+                self.chunk_labels_for_tsne.append(label)
+
+            # Step 1.3: Compute attention weights
+            attn_weights, raw_scores = self.attn_scorer(chunk_embeds, temperature=self.temperature, epoch=epoch)  # (1, T, 1)
+            
+            # Step 1.4: Gated pooling for session-level CE
+            pooled, attn_gated, entropy_gated = self.pooling(chunk_embeds, raw_scores, return_weights=True, return_entropy=True)
+            
+            if phase == 2: # Phase 2
+                attn_weights = attn_gated
+
+            # Entropies for adaptive temperature adjusting and debugging
+            if phase < 2:
+                entropy = -torch.sum(attn_weights * torch.log(attn_weights + 1e-8), dim=1).mean()
+                entropy_attn_list.append(entropy)
+            else:
+                entropy_gated_list.append(entropy_gated)
+            
+            session_embeds.append(pooled.squeeze(0))
+            target_labels.append(label)
+ 
+            # Step 1.5: Sparsity regularization loss
+            entropy_list.append(entropy)
+            
+            # --- For session-level t-SNE plot --- 
+            self.session_embeddings_for_tsne.append(pooled.squeeze(0).detach().cpu().numpy())
+            self.session_labels_for_tsne.append(label)
+            
+            # Step 1.6: Store contrastive info (projection + attention)
+            if phase < 1:
+                weighted_proj = attn_weights.squeeze(0) * chunk_proj_embeds
+                all_proj_embeddings.append(weighted_proj)
+                all_attn_weights.append(attn_weights.view(-1))
+            all_labels_tensor.append(chunk_labels_tensor)
+
+            # --- DEBUG: Attention Information ---
+            if phase < 2:
+                attn_np = attn_weights.detach().cpu().squeeze().numpy()
+                print(f"[DEBUG][Attn Weights] {attn_np.tolist()}")
+                print(f"[DEBUG][Attn Sparsity] mean={attn_np.mean():.4f}, std={attn_np.std():.4f}, entropy={entropy.item():.4f}")
+            else:
+                gated_np = attn_weights.detach().cpu().squeeze().numpy()
+                print(f"[DEBUG][Gated Attn Weights] {gated_np.tolist()}")
+                print(f"[DEBUG][Gated Attn Sparsity] mean={gated_np.mean():.4f}, std={gated_np.std():.4f}, entropy={entropy.item():.4f}")
+            
+            # Step 1.7: Apply ChunkAuxClassifier on Top-K chunk embeds for discriminativity
+            attn = raw_scores.squeeze(0).squeeze(-1)
+            if len(attn) < 1:
+                print("Something's Wrong..")
+                continue
+            k = min(len(attn), int(len(attn) * self.top_k_ratio))
+            
+            selected_idx = torch.topk(attn, k=k).indices
+            topk_embeds = chunk_embeds[0][selected_idx]  # (K, D)
+            topk_logits = self.chunk_aux_classifier(topk_embeds)
+            topk_labels = torch.tensor([label] * len(topk_logits), dtype=torch.long, device=self.device)
+            loss_i = self.criterion(topk_logits, topk_labels)
+            chunk_ce_losses.append(loss_i)
+        
+        # === Step 2: SupCon Loss ===
+        if len(all_proj_embeddings) == 0:
+            print("[Skip SupCon] No valid projected chunks selected for contrastive loss.")
+            contrastive_term = torch.tensor(0.0, device=self.device)
+            contrastive_term_scaled = self.contrastive_weight * contrastive_term
+        else:
+            proj_concat = torch.cat(all_proj_embeddings, dim=0)
+            label_concat = torch.cat(all_labels_tensor, dim=0)
+            if label_concat.unique().numel() >= 2:
+                proj_norm = F.normalize(proj_concat, dim=-1)
+                print(f"[DEBUG] norm mean={proj_norm.mean().item():.4f}, std={proj_norm.std().item():.4f}")
+                contrastive_term = self.contrastive_loss_fn(proj_norm, label_concat)
+            else:
+                print("[Skip SupCon] Only one unique label in batch.")
+                contrastive_term = None
+            if contrastive_term is not None:
+                contrastive_term_scaled = self.contrastive_weight * contrastive_term
+            else:
+                contrastive_term_scaled = torch.tensor(0.0, device=self.device)
+
+
+        # === Step 3: Session-level CE Loss ===
+        batch_embeds = torch.stack(session_embeds, dim=0)
+        label_tensor = torch.tensor(target_labels, dtype=torch.long, device=self.device)
+        outputs = self.classifier(batch_embeds)
+        ce_loss = self.criterion(outputs, label_tensor)
+        ce_loss_scaled = self.ce_weight * ce_loss
+        preds = torch.argmax(outputs, dim=1)
+
+        # === Step 4: Sparsity Loss (for debugging) ===
+        sparsity_loss = torch.stack(entropy_list).mean()
+        sparsity_loss_scaled = sparsity_loss * 0.3
+
+        # === Step 5: Chunk-level CE Loss ===
+        chunk_ce_loss = torch.stack(chunk_ce_losses).mean() if len(chunk_ce_losses) > 0 else torch.tensor(0.0, device=self.device)
+        chunk_ce_loss_scaled = self.chunk_ce_weight * chunk_ce_loss
+        
+        # === Step 6: Total Loss Composition ===
+        if phase == 0:
+            if contrastive_term is not None:
+                loss_total = contrastive_term_scaled + sparsity_loss_scaled
+            else:
+                print("⚠️ Skipping backward for contrastive (no positive pairs)")
+                return None
+        elif phase == 1:
+            loss_total = chunk_ce_loss_scaled
+        else:
+            loss_total = ce_loss_scaled
+
+        # --- for adaptive temperature scheduling ---
+        entropy_attn_mean = torch.stack(entropy_attn_list).mean() if len(entropy_attn_list) > 0 else torch.tensor(0.0, device=self.device)
+        entropy_gated_mean = torch.stack(entropy_gated_list).mean() if len(entropy_gated_list) > 0 else torch.tensor(0.0, device=self.device)
+
+        print("\n📊 [Loss Breakdown & Prediction]")
+        print("─" * 60)
+        print(f"🔧 Loss Weights:\n   ▸ CE         : {self.ce_weight:.2f}\n   ▸ Contrastive: {self.contrastive_weight:.2f}\n    ▸ ChunkCE    : {self.chunk_ce_weight:.2f}")
+        print("\n📉 Loss Components (PHASE {phase}):")
+        print(f"   ▸ CE         : {ce_loss.item():.4f} × {self.ce_weight:.2f} = {ce_loss_scaled.item():.4f}")
+        print(f"   ▸ Contrastive: {contrastive_term.item():.4f} × {self.contrastive_weight:.2f} = {contrastive_term_scaled.item():.4f}")
+        print(f"   ▸ Chunk CE   : {chunk_ce_loss.item():.4f} x {self.ce_weight:.2f} = {ce_loss_scaled.item():.4f}")
+        print(f"   ▸ Entropy    : Scorer = {entropy_attn_mean:.4f}, Gated = {entropy_gated_mean:.4f}")
+        print(f"   ▸ Sparsity   : {sparsity_loss.item():.4f} x 0.3 = {sparsity_loss_scaled.item():.4f}")
+        print(f"   ▶ Total Loss : {loss_total.item():.4f}")
+        print("─" * 60)
+
+
+        # --- Optional Prediction Logging ---
+        probs = torch.softmax(outputs, dim=1)
+        print("\n🔎 [Batch Predictions]")
+        for i in range(len(label_tensor)):
+            gt = label_tensor[i].item()
+            prob = probs[i].detach().cpu().numpy()
+            pred = np.argmax(prob)
+            confidence = prob[pred]
+            print(f"   ▸ Session {batch_session_ids[i]} | GT: {gt} | Pred: {pred} | Conf: {confidence:.4f} | Prob: {np.round(prob, 4)}")
+        print("═" * 60)
+        
+        return (
+            loss_total, ce_loss, # Full loss for backward
+            contrastive_term_scaled, sparsity_loss_scaled, chunk_ce_loss_scaled, # For raw monitoring (Already scaled)
+            preds, label_tensor,
+            chunk_ce_loss.item(), # For best model check
+            entropy_attn_mean, entropy_gated_mean
+        )
     def train(self, data_loader):
         '''
         Main training loop for session-level emotion classification using:
