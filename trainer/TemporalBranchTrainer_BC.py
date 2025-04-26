@@ -214,7 +214,7 @@ from modules.ChunkAuxClassifier import ChunkAuxClassifier
 # from modules.GatedAttentionPooling import GatedAttentionPooling
 
 from tools.utils import SupConLossTopK# , AlignCosineLoss
-from tools.utils import reconstruct_sessions, run_tsne_and_plot
+from tools.utils import reconstruct_sessions, run_tsne_and_plot, straight_through_topk
 
 class TemporalBranchTrainer_BC(BaseTrainer):
     """
@@ -542,6 +542,13 @@ class TemporalBranchTrainer_BC(BaseTrainer):
             # 1) encode all chunks at once  (T,1,128) ➜ (1,T,D)
             chunk_emb = self.forward_single_chunk_checkpoint(chunks)  # (T,D)
             chunk_emb = chunk_emb.unsqueeze(0)                        # (1,T,D)
+            
+            # ★──────── per-chunk debug & t-SNE ───────────────
+            for idx, cemb in enumerate(chunk_emb[0]):                # iterate T chunks
+                print(f"  Chunk {idx}: mean={cemb.mean():.4f}, std={cemb.std():.4f}")
+                self.chunk_embeddings_for_tsne.append(cemb.detach().cpu().numpy())
+                self.chunk_labels_for_tsne.append(label)
+            # ────────────────────────────────────────────────
 
             # 2) attention scorer
             attn_soft, raw_scores = self.attn_scorer(chunk_emb)       # (1,T,1)
@@ -575,6 +582,11 @@ class TemporalBranchTrainer_BC(BaseTrainer):
             # 6) session-level pooling
             pooled, attn_gated, ent_gated = self.pooling(
                 gated_emb, raw_scores, return_weights=True, return_entropy=True)
+            # ★──────── session-level t-SNE ───────────────────
+            sess_emb = pooled.squeeze(0)                              # (D,)
+            self.session_embeddings_for_tsne.append(sess_emb.detach().cpu().numpy())
+            self.session_labels_for_tsne.append(label)
+            # ────────────────────────────────────────────────
 
             session_embeds.append(pooled.squeeze(0))
             target_labels.append(label)
@@ -1140,9 +1152,9 @@ class TemporalBranchTrainer_BC(BaseTrainer):
         self.pooling.eval()
         self.classifier.eval()
 
-    """
+"""
         def forward_batch(self, batch, epoch, phase):
-        """
+        '''
         Forward function for one training batch (B sessions) during epoch `epoch`.
 
         Handles phase-wise:
@@ -1164,7 +1176,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
         - t-SNE logging
         - Attention entropy debug
         - Full loss composition & debug prints
-        """
+        '''
 
         chunk_tensors, batch_labels, batch_session_ids, _ = batch
         B = len(batch_labels)
@@ -1790,4 +1802,4 @@ class TemporalBranchTrainer_BC(BaseTrainer):
                 print(f"[SAVE] Best Validation loss model updated at epoch {epoch}")
         
         self.plot_losses_and_lrs()
-    """
+"""

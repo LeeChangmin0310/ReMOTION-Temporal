@@ -2,6 +2,115 @@ import torch
 import torch.nn as nn
 import torch.utils.checkpoint as checkpoint
 
+
+class ChunkForwardModule(nn.Module):
+    """
+    Feed one **chunk** (video or pre-extracted rPPG) through
+        • PhysMamba (rPPG encoder) – always executed
+        • TemporalBranch            – learns temporal features
+
+    Key features
+    -------------
+    • The encoder can be *frozen*; in that case we:
+        – wrap the forward pass with `torch.no_grad()`  
+        – optionally slice the input into micro-batches  
+          to cap peak GPU memory and avoid OOM.
+    • Optional gradient-checkpointing on the TemporalBranch.
+    """
+
+    def __init__(
+        self,
+        encoder: nn.Module,
+        temporal_branch: nn.Module,
+        use_checkpoint: bool = False,
+        freeze_encoder: bool = True,
+        micro_bs: int = 24,          # max chunks processed per encoder call
+    ):
+        super().__init__()
+        self.encoder = encoder
+        self.temporal_branch = temporal_branch
+        self.use_checkpoint = use_checkpoint
+        self.freeze_encoder = freeze_encoder
+        self.micro_bs = micro_bs
+
+        # Freeze encoder weights if requested
+        if self.freeze_encoder:
+            for p in self.encoder.parameters():
+                p.requires_grad = False
+            self.encoder.eval()
+
+    # ------------------------------------------------------------------ #
+    # Helper for gradient-checkpointing on TemporalBranch only
+    # ------------------------------------------------------------------ #
+    def _temporal(self, rppg):
+        return self.temporal_branch(rppg)
+
+    # ------------------------------------------------------------------ #
+    # Encoder forward with memory-safe micro-batching
+    # ------------------------------------------------------------------ #
+    def _run_encoder(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Parameters
+        ----------
+        x : Tensor
+            • shape (N, 1, 128)  – rPPG snippet batch
+            • shape (1, C, T, H, W) – single video chunk
+
+        Returns
+        -------
+        Tensor
+            shape (N, T_rppg) – raw rPPG sequence per chunk
+        """
+
+        def _enc(sub):
+            # Encoder is frozen – no gradients, no activation storage
+            with torch.no_grad():
+                return self.encoder(sub)
+
+        # If batch is small enough, run once
+        if x.size(0) <= self.micro_bs:
+            return _enc(x).detach()               # detach breaks graph
+
+        # Otherwise slice into micro-batches to cap peak memory
+        outs = []
+        for s in range(0, x.size(0), self.micro_bs):
+            outs.append(_enc(x[s:s + self.micro_bs]))
+        return torch.cat(outs, 0).detach()        # (N, T_rppg)
+
+    # ------------------------------------------------------------------ #
+    # Main forward
+    # ------------------------------------------------------------------ #
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Accepts
+        -------
+        • (1, C, T, H, W)  : a single video chunk
+        • (N, 1, 128)      : batch of pre-segmented rPPG snippets
+
+        Returns
+        -------
+        Tensor – chunk embeddings with shape (N, D)
+        """
+
+        # 1) PhysMamba → rPPG
+        if x.dim() == 5:                          # video input
+            rppg = self._run_encoder(x)           # (1, T_rppg)
+        else:                                     # rPPG batch
+            rppg = self._run_encoder(x)           # (N, T_rppg)
+
+        # 2) Make rPPG a leaf tensor so TemporalBranch gradients flow
+        rppg = rppg.requires_grad_(True)
+
+        # 3) TemporalBranch (optionally checkpointed)
+        if self.use_checkpoint:
+            emb = checkpoint.checkpoint(self._temporal, rppg)
+        else:
+            emb = self.temporal_branch(rppg)      # (N, D)
+
+        return emb
+
+
+'''
 class ChunkForwardModule(nn.Module):
     """
     A helper module to wrap:
@@ -38,7 +147,7 @@ class ChunkForwardModule(nn.Module):
             rppg = rppg.detach().requires_grad_()
         # print(f"[CHECK] rppg.requires_grad: {rppg.requires_grad}") 
         
-        '''
+        """
         # === Normalize rPPG ===
         mean = rppg.mean(dim=1, keepdim=True)
         std = rppg.std(dim=1, keepdim=True)
@@ -46,7 +155,7 @@ class ChunkForwardModule(nn.Module):
         rppg_norm = rppg_norm.unsqueeze(-1)  # shape: (1, T, 1)
         # print(f"[CHECK] rppg_norm grad_fn: {rppg_norm.grad_fn}")
         # print(f"[CHECK] rppg_norm.requires_grad: {rppg.requires_grad}")  
-        '''
+        """
         
         # === TemporalBranch ===
         if self.use_checkpoint:
@@ -55,3 +164,4 @@ class ChunkForwardModule(nn.Module):
             emb = self.temporal_branch(rppg)
 
         return emb  # shape: (1, embedding_dim)
+'''
