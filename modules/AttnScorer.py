@@ -30,7 +30,8 @@ class AttnScorer(nn.Module):
         # It compresses the D-dimensional input to a single scalar score per chunk.
         self.scorer = nn.Sequential(
             nn.Linear(input_dim, input_dim // 2),  # Reduces dimension
-            nn.Tanh(),                             # Non-linear activation
+            nn.GELU(),                             # smoother, no saturation
+            # nn.Tanh(),                             # Non-linear activation
             nn.Linear(input_dim // 2, 1)           # Outputs a scalar score
         )
 
@@ -47,13 +48,32 @@ class AttnScorer(nn.Module):
         scores = self.scorer(z)  # Raw attention scores: (B, T, 1)
         raw_scores = scores - scores.mean(dim=1, keepdim=True) # Center the scores (zero-mean across time dimension) for stability
         
-        if epoch < 10: # Phase 0.0
-            return F.softmax(raw_scores / temperature, dim=1), raw_scores
-        elif 10 <= epoch < 35: # Phase 0.5 and 1
-            # return entmax.entmax15(raw_scores, dim=1), raw_scores
-            return F.softmax(raw_scores / temperature, dim=1), raw_scores
+        # --- scale factor γ --------------------------------
+        if epoch < 20:
+            sigma_star = 1.2
         else:
-            return None, raw_scores # return pre-softmax raw attn score
+            sigma_star = 1.5
+        gamma = torch.tensor(
+            sigma_star / (self.running_score_std + 1e-4),
+            device=raw_scores.device).clamp_(0.5, 3.0)
+        raw_scaled = raw_scores * gamma
+        
+        # --- choose attention kernel ----------------------
+        if epoch < 5:                        # Phase 0-a:  Softmax explore
+            attn = torch.softmax(raw_scaled / temperature, dim=1)
+        
+        elif epoch < 20:                     # Phase 0-b:  α-Entmax warm-up
+            # α 1.9→1.6 linearly
+            alpha = 2.0 - 0.1 * max(0, epoch - 4)
+            attn  = entmax.entmax_bisect(raw_scaled, alpha=alpha, dim=1)
+        
+        elif epoch < 35:                     # Phase 1:    Entmax15 sparse
+            attn  = entmax.entmax15(raw_scaled, dim=1)
+        
+        else:                                # Phase 2:    scorer frozen
+            attn  = None                     # use raw_scores only
+        
+        return attn, raw_scores
         
         """
         attn_scores = F.softmax(scores / self.temperature, dim=1) # Apply softmax across time (T) with temperature scaling: (B, T, 1)

@@ -13,6 +13,19 @@ rPPG → TemporalBranch → Chunk Embedding
                          ClassificationHead
 
 
+Video session  →  N temporal chunks  ──▶  PhysMamba(encoder, frozen)
+                                         │  rPPG 1-D signal
+                                         ▼
+                                    TemporalBranch
+                                         │  chunk-embed z_t  (D=256)
+             ┌─────────────┬─────────────┴─────────────┐
+             │             │                           │
+      (Ph0) Projection  AttnScorer            (Ph2)   GatedPooling
+             │             │                           │
+     SupCon 128-dim   raw score s_t               session-embed Z_s
+             ▼             ▼                           ▼
+      SupConLoss       α-scheduler              Classifier(CE)
+                                 (Phase-specific heads)
 
 
 
@@ -276,7 +289,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
         
         wandb.init(
             project="TemporalReMOTION",
-            name=f"Exp_{self.config.TRAIN.MODEL_FILE_NAME}_Final_NoEntmax_graddebug",
+            name=f"Exp_{self.config.TRAIN.MODEL_FILE_NAME}_Final_Entmax",
             # config=cfg_dict,
             dir="./wandb_logs"
         )
@@ -384,7 +397,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
         # -------------------------------- History Tracking --------------------------------
         self.avg_entropy_attn = None
         
-        self.best_train_loss = float('inf')
+        self.best_ce_loss = float('inf')
         self.best_cos_loss = float('inf')
         self.best_chunk_ce_loss = float('inf')
         self.best_val_loss = float('inf')
@@ -440,36 +453,49 @@ class TemporalBranchTrainer_BC(BaseTrainer):
         PHASE0_END = 19
         PHASE1_END = 34
         PHASE2_END = self.max_epoch - 1
-
-        if epoch <= PHASE0_END:
-            phase = 0
-            lr, wd, t_max = 3e-4, 1e-4, 20
-            self.contrastive_weight = max(0.2, 1.0 - 0.8 * (epoch / PHASE0_END))
+        
+        # ───────────────────── Phase-wise setup ─────────────────────
+        if epoch <= PHASE0_END:          # Phase-0   (0–19)
+            phase, lr, wd, t_max = 0, 3e-4, 1e-4, 20
+            
+            # ① SupCon λ : 0-4 (1→0.6) , 5-19 (0.6→0.3)
+            if   epoch <= 4:
+                self.contrastive_weight = 1.0 - 0.1 * epoch          # 1.0→0.6
+            else:
+                self.contrastive_weight = 0.6 - 0.3 * (epoch-4)/15   # 0.6→0.3
+            self.contrastive_weight = max(0.3, self.contrastive_weight)
             self.chunk_ce_weight = 0.0
-            self.ce_weight = 0.0
-            self.temperature = 1.0
-            if self.avg_entropy_attn is not None:
-                self.temperature = max(1.0, 2.7 - self.avg_entropy_attn)
-            elif self.avg_entropy_attn is None:
+            self.ce_weight       = 0.0
+            
+            # adaptive τ  (0.5 ≤ τ ≤ 1.2)
+            if self.avg_entropy_attn is None:
                 self.temperature = 1.0
+            else:
+                tau = 2.5 - self.avg_entropy_attn
+                self.temperature = max(0.5, min(1.2, tau))
 
-        elif epoch <= PHASE1_END:
-            phase = 1
-            lr, wd, t_max = 2e-4, 5e-5, 15
+        elif epoch <= PHASE1_END:        # Phase-1   (20–34)
+            phase, lr, wd, t_max = 1, 2e-4, 5e-5, 15
+            
+            # ② Chunk-CE λ : 20-24 = 0.3, 25-34 = 0.5→0.7
+            if epoch <= 24:
+                self.chunk_ce_weight = 0.3
+            else:
+                self.chunk_ce_weight = 0.5 + 0.02 * (epoch-25)  # 0.5→0.7
+            self.chunk_ce_weight = min(0.7, self.chunk_ce_weight)
             self.contrastive_weight = 0.0
-            self.chunk_ce_weight = 0.3
-            self.ce_weight = 0.0
-            self.temperature = 1.0
+            self.ce_weight          = 0.0
+            self.temperature        = 1.0         # fixed
 
-        else:
-            phase = 2
-            lr, wd, t_max = 1e-4, 5e-5, 10
+        else:                          # Phase-2   (35+)
+            phase, lr, wd, t_max = 2, 1e-4, 5e-5, 10
+
             self.contrastive_weight = 0.0
-            self.chunk_ce_weight = 0.0
-            self.ce_weight = 1.0
-            self.temperature = 1.0
-
-        # Gradients
+            self.chunk_ce_weight    = 0.0
+            self.ce_weight          = 1.0
+            self.temperature        = 1.0
+            
+        # ─────── Gradient gate ───────
         for p in self.attn_scorer.parameters():
             p.requires_grad = (phase <= 1)
         for p in self.chunk_projection.parameters():
@@ -519,7 +545,28 @@ class TemporalBranchTrainer_BC(BaseTrainer):
     # ----------------------------------------------------------
 
     def forward_batch(self, batch, epoch, phase):
-        """One mini-batch forward pass (B sessions)."""
+        """
+        One mini-batch forward pass (B sessions).
+        Handles phase-wise:
+        - Phase 0: SupConLossTopK + adaptive temperature
+        - Phase 1: Chunk-level CE with Top-K + threshold
+        - Phase 2: Session-level CE with GatedPooling
+        
+        Handles:
+        - TemporalBranch → chunk-wise rPPG embeddings
+        - AttnScorer: pre-softmax raw score
+        - SupConLossTopK with Top-K + threshold selection from epoch ≥ 20
+        - GatedPooling for CE loss
+        - ChunkAuxClassifier (epoch 20–34 only) for chunk-level CE supervision
+        - SparsityLoss based on entropy: AttnScorer vs Gated
+        - t-SNE logging for chunk/session visualization
+        - Full debug printouts for embeddings, attention, entropy, losses
+        
+        Additional:
+        - t-SNE logging
+        - Attention entropy debug
+        - Full loss composition & debug prints
+        """
         chunk_tensors, batch_labels, batch_sids, _ = batch
         B = len(batch_labels)
 
@@ -550,15 +597,35 @@ class TemporalBranchTrainer_BC(BaseTrainer):
                 self.chunk_labels_for_tsne.append(label)
             # ────────────────────────────────────────────────
 
-            # 2) attention scorer
-            attn_soft, raw_scores = self.attn_scorer(chunk_emb)       # (1,T,1)
+            # 2) attention scorer 
+            attn_soft, raw_scores = self.attn_scorer(
+                chunk_emb,                      # (1,T,1)
+                temperature=self.temperature,   # adaptive τ
+                epoch=epoch)                    # phase-aware
 
             # 3) build α  – soft in Phase-0, ST-Top-K in Phase-1
-            if epoch < 20:                                            # Phase-0
+            if phase == 0:                                            # Phase-0
                 alpha = attn_soft
-            else:                                                     # Phase-1
-                k = max(6, int(T * self.top_k_ratio))
-                alpha = straight_through_topk(raw_scores, k, tau=0.7)
+            if phase == 1:                           # Phase-1 ST-Top-K
+                if len(raw_scores.squeeze(0).squeeze(-1)) < 1:
+                    print("Empty attention scores – skip this session")
+                    continue
+                k  = min(T, max(6, int(T * self.top_k_ratio)))
+                alpha = straight_through_topk(raw_scores,
+                                            k=k,
+                                            tau=1.0, # self.temperature
+                                            use_entmax=(phase==1))
+            elif phase == 2:
+                if len(raw_scores.squeeze(0).squeeze(-1)) < 1:
+                    print("Empty attention scores – skip this session")
+                    continue
+                k  = min(T, max(6, int(T * self.top_k_ratio)))
+                alpha = straight_through_topk(raw_scores,
+                                            k=k,
+                                            tau=1.0, # self.temperature
+                                            use_entmax=(phase==1))
+            else:
+                alpha = attn_soft
 
             # 4) apply α before projection  (keeps grad path)
             gated_emb   = chunk_emb * alpha                           # (1,T,D)
@@ -599,8 +666,13 @@ class TemporalBranchTrainer_BC(BaseTrainer):
 
             # 8) OPTIONAL chunk-level debug
             if phase < 2:
-                print(f"[DEBUG][Attn] mean={alpha.mean():.3f} "
-                    f"std={alpha.std():.3f} ent={entropy_attn.item():.3f}")
+                attn_np = attn_soft.detach().cpu().squeeze().numpy()
+                print(f"[DEBUG][Attn Weights] {attn_np.tolist()}")
+                print(f"[DEBUG][Attn Sparsity] mean={attn_np.mean():.4f}, std={attn_np.std():.4f}, entropy={entropy_attn.item():.4f}")
+            else:
+                gated_np = attn_gated.detach().cpu().squeeze().numpy()
+                print(f"[DEBUG][Gated Attn Weights] {gated_np.tolist()}")
+                print(f"[DEBUG][Gated Attn Sparsity] mean={gated_np.mean():.4f}, std={gated_np.std():.4f}, entropy={ent_gated.item():.4f}")
 
         # ───── phase-specific losses ─────────────────────────
         # SupCon (Phase-0)
@@ -685,7 +757,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
             loss_total,
             ce_loss,
             contrastive_term_scaled,
-            0.3 * sparsity_loss,      # sparsity_scaled kept for compatibility
+            sparsity_loss,
             chunk_ce_loss_scaled,
             torch.argmax(ce_logits, 1),
             label_vec,
@@ -804,7 +876,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
                         ("AttentionScorer", self.attn_scorer),
                         ("Projection", self.chunk_projection),
                         ("ChunkAuxClassifier", self.chunk_aux_classifier),
-                        ("GatedAttentionPooling", self.pooling),
+                        ("GatedPooling", self.pooling),
                         ("Classifier", self.classifier),
                     ]
                     for name, module in modules:
@@ -830,7 +902,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
             self.loss_sparsity_per_epoch.append(sparsity_total / num_batches)
             self.loss_chunk_ce_per_epoch.append(chunk_ce_total / num_batches)
 
-            print(f"Epoch {epoch}: Train Loss = {avg_loss:.4f}, Acc = {acc:.4f}")
+            print(f"Epoch {epoch}: Train Loss = {avg_loss:.4f}, Acc = {acc:.4f}, Entropy = {avg_entropy_attn:.4f}")
             
             self.run_tsne_and_plot(level="chunk", epoch=epoch, phase="train")
             self.run_tsne_and_plot(level="session", epoch=epoch, phase="train")
@@ -867,12 +939,12 @@ class TemporalBranchTrainer_BC(BaseTrainer):
                 self.save_model(epoch=epoch, val_loss=val_loss, train_loss=avg_loss, val_metrics=metrics, tag="best_loss")
                 print(f"[SAVE] Best Validation loss model updated at epoch {epoch}")
                 
-            if avg_loss < self.best_train_loss:
-                self.best_train_loss = avg_loss
-                self.save_model(epoch=epoch, val_loss=val_loss, train_loss=avg_loss, val_metrics=metrics, tag="best_train_loss")
+            if ce_total / num_batches < self.best_ce_loss:
+                self.best_ce_loss = ce_total / num_batches
+                self.save_model(epoch=epoch, val_loss=val_loss, train_loss=avg_loss, val_metrics=metrics, tag="best_ce_loss")
                 print(f"[SAVE] Best Train Loss model updated at epoch {epoch}")
-            if chunk_ce_loss > 0 and train_chunk_ce < self.best_chunk_ce_loss:
-                self.best_chunk_ce_loss = train_chunk_ce
+            if (chunk_ce_total / num_batches) > 0 and (chunk_ce_total / num_batches) < self.best_chunk_ce_loss:
+                self.best_chunk_ce_loss = chunk_ce_total / num_batches
                 self.save_model(epoch=epoch, val_loss=val_loss, train_loss=avg_loss, val_metrics=metrics, tag="best_chunkce")
                 print(f"[SAVE] Best Chunk CE loss model updated at epoch {epoch}")
 
@@ -969,7 +1041,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
 
         base_name = self.config.TRAIN.MODEL_FILE_NAME
         tags = ["best_acc", "best_f1", "best_metric", "best_loss", 
-                "best_train_loss", "best_chunkce", "last_epoch"]
+                "best_ce_loss", "best_chunkce", "last_epoch"]
         results = {}
 
         for tag in tags:

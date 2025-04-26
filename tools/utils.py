@@ -140,17 +140,24 @@ def run_tsne_and_plot(self, level="chunk", epoch=0, phase="train"):
         self.session_labels_for_tsne.clear()
 
 # --- Utility
-def straight_through_topk(scores, k):
+def straight_through_topk(
+        scores: torch.Tensor,
+        k: int,
+        tau: float = 1.0,
+        use_entmax: bool = True):
     """
-    Forward  : hard Top-K mask
-    Backward : softmax(scores/τ) 로 그대로 gradient 전달
-    scores : (B, T, 1)
-    returns : alpha_st  (B, T, 1)
+    Forward : hard 1/0 Top-K mask
+    Backward: soft probs (Entmax or Softmax) for gradient
     """
-    probs = F.softmax(scores, dim=1)         # (B,T,1)
-    top_val, top_idx = torch.topk(probs, k=k, dim=1)
+    if use_entmax:
+        probs = entmax.entmax15(scores / tau, dim=1)   # sparse soft
+    else:
+        probs = torch.softmax(scores / tau, dim=1)     # dense soft
+
+    _, top_idx = torch.topk(probs, k=k, dim=1)
     hard = torch.zeros_like(probs).scatter_(1, top_idx, 1.0)
-    return (hard - probs).detach() + probs      # ST(straight-through)-trick
+    return (hard - probs).detach() + probs
+
 
 
 # --- Utility functions for supervised contrastive loss with top-k attention-based chunk selection ---
@@ -191,6 +198,7 @@ class SupConLossTopK(nn.Module):
 
         # Step 1: Normalize and compute similarity matrix
         features = F.normalize(features, dim=1)
+        print(f"[DEBUG] norm mean={features.mean().item():.4f}, std={features.std().item():.4f}")
         sim_matrix = torch.matmul(features, features.T) / self.temperature
         sim_max, _ = sim_matrix.max(dim=1, keepdim=True)
         sim_matrix = sim_matrix - sim_max.detach()  # log-sum-exp stability
@@ -217,7 +225,7 @@ class SupConLossTopK(nn.Module):
             # Adaptive limit: ensure balanced pairs and avoid overload
             max_pos_i = max_pos_i = min(
                 len(pos_idx),
-                max(6, min(self.max_pos, int(len(neg_idx) * self.pos_neg_ratio)))
+                max(1, min(self.max_pos, int(len(neg_idx) * self.pos_neg_ratio)))
             )
             max_neg_i = min(len(neg_idx), max(6, self.max_neg))
 
@@ -226,8 +234,11 @@ class SupConLossTopK(nn.Module):
                 new_mask_pos[i][pos_idx[top_pos]] = 1.0
 
             if max_neg_i > 0:
-                top_neg = torch.topk(sim_matrix[i][neg_idx], max_neg_i, largest=False).indices
-                new_mask_neg[i][neg_idx[top_neg]] = 1.0
+                # top_neg = torch.topk(sim_matrix[i][neg_idx], max_neg_i, largest=False).indices
+                # new_mask_neg[i][neg_idx[top_neg]] = 1.0
+                k_neg = min(max_neg_i, len(neg_idx))
+                rand_pos = torch.randperm(len(neg_idx), device=device)[:k_neg]  # positions
+                new_mask_neg[i][neg_idx[rand_pos]] = 1.0                       # absolute idx
 
         # Step 4: Compute loss from selected masks
         numerator = (exp_sim * new_mask_pos).sum(dim=1)
