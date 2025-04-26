@@ -272,7 +272,6 @@ class TemporalBranchTrainer_BC(BaseTrainer):
     Loss Composition:
     + SupConLossTopK(selected_proj, label) × contrastive_weight
     + CrossEntropyLoss(session_pred, label) × ce_weight
-    + KLAlignLoss(logits_topk, logits_gated) × align_weight
     + Chunk-level CE (chunk_pred, label) × chunk_ce_weight
     + SparsityLoss(attn_entropy) × sparsity_weight
     """
@@ -289,7 +288,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
         
         wandb.init(
             project="TemporalReMOTION",
-            name=f"Exp_{self.config.TRAIN.MODEL_FILE_NAME}_Final_Entmax",
+            name=f"Exp_{self.config.TRAIN.MODEL_FILE_NAME}_sparsity_again",
             # config=cfg_dict,
             dir="./wandb_logs"
         )
@@ -328,8 +327,8 @@ class TemporalBranchTrainer_BC(BaseTrainer):
         # ------------------------------ Attention Scorer ------------------------------
         self.attn_scorer = AttnScorer(
             input_dim=config.MODEL.EMOTION.TEMPORAL_EMBED_DIM
-            # temperature=0.7
         ).to(self.device)
+        self.lambda_ent = 0.1 # for sparsity loss
         
         # ------------------------------ Projection Head -------------------------------
         """Maps chunk embeddings to a projection space for contrastive learning"""
@@ -395,8 +394,6 @@ class TemporalBranchTrainer_BC(BaseTrainer):
         self.run_tsne_and_plot = partial(run_tsne_and_plot, self)
         
         # -------------------------------- History Tracking --------------------------------
-        self.avg_entropy_attn = None
-        
         self.best_ce_loss = float('inf')
         self.best_cos_loss = float('inf')
         self.best_chunk_ce_loss = float('inf')
@@ -405,13 +402,13 @@ class TemporalBranchTrainer_BC(BaseTrainer):
         self.best_val_acc = 0.0
         self.best_val_f1 = 0.0
         self.best_val_metric = 0.0
+        self.avg_entropy_attn = None
         
         self.train_losses = []
         self.val_losses = []
         self.loss_ce_per_epoch = []
         self.loss_contrastive_per_epoch = []
         self.loss_sparsity_per_epoch = []
-        self.loss_cos_per_epoch = []
         self.loss_chunk_ce_per_epoch = []
 
         # ---------------------------- t-SNE Embedding Containers ----------------------------
@@ -450,11 +447,12 @@ class TemporalBranchTrainer_BC(BaseTrainer):
         Phase 1 (20–34): Chunk CE + Top-K
         Phase 2 (35–49): Final CE + Classifier + GatedPooling
         """
+        # ───────────────────── Phase-wise setup ─────────────────────
         PHASE0_END = 19
         PHASE1_END = 34
         PHASE2_END = self.max_epoch - 1
         
-        # ───────────────────── Phase-wise setup ─────────────────────
+        # ───────────────────── Phase-0 ─────────────────────
         if epoch <= PHASE0_END:          # Phase-0   (0–19)
             phase, lr, wd, t_max = 0, 3e-4, 1e-4, 20
             
@@ -462,7 +460,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
             if   epoch <= 4:
                 self.contrastive_weight = 1.0 - 0.1 * epoch          # 1.0→0.6
             else:
-                self.contrastive_weight = 0.6 - 0.3 * (epoch-4)/15   # 0.6→0.3
+                self.contrastive_weight = 0.6 - 0.3 * (epoch-4)/15  # 0.6→0.3
             self.contrastive_weight = max(0.3, self.contrastive_weight)
             self.chunk_ce_weight = 0.0
             self.ce_weight       = 0.0
@@ -473,23 +471,24 @@ class TemporalBranchTrainer_BC(BaseTrainer):
             else:
                 tau = 2.5 - self.avg_entropy_attn
                 self.temperature = max(0.5, min(1.2, tau))
-
-        elif epoch <= PHASE1_END:        # Phase-1   (20–34)
+        
+        # ───────────────────── Phase-1 ─────────────────────
+        elif epoch <= PHASE1_END:        
             phase, lr, wd, t_max = 1, 2e-4, 5e-5, 15
             
             # ② Chunk-CE λ : 20-24 = 0.3, 25-34 = 0.5→0.7
             if epoch <= 24:
-                self.chunk_ce_weight = 0.3
+                self.chunk_ce_weight = 0.25
             else:
-                self.chunk_ce_weight = 0.5 + 0.02 * (epoch-25)  # 0.5→0.7
-            self.chunk_ce_weight = min(0.7, self.chunk_ce_weight)
+                self.chunk_ce_weight = 0.35 + 0.025 * (epoch-25)      # 0.35→0.60
+            self.chunk_ce_weight = min(0.60, self.chunk_ce_weight)
             self.contrastive_weight = 0.0
             self.ce_weight          = 0.0
             self.temperature        = 1.0         # fixed
-
-        else:                          # Phase-2   (35+)
+        
+        # ───────────────────── Phase-2 ─────────────────────
+        else:                          
             phase, lr, wd, t_max = 2, 1e-4, 5e-5, 10
-
             self.contrastive_weight = 0.0
             self.chunk_ce_weight    = 0.0
             self.ce_weight          = 1.0
@@ -590,7 +589,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
             chunk_emb = self.forward_single_chunk_checkpoint(chunks)  # (T,D)
             chunk_emb = chunk_emb.unsqueeze(0)                        # (1,T,D)
             
-            # ★──────── per-chunk debug & t-SNE ───────────────
+            # ──────── per-chunk debug & t-SNE ───────────────
             for idx, cemb in enumerate(chunk_emb[0]):                # iterate T chunks
                 print(f"  Chunk {idx}: mean={cemb.mean():.4f}, std={cemb.std():.4f}")
                 self.chunk_embeddings_for_tsne.append(cemb.detach().cpu().numpy())
@@ -599,31 +598,21 @@ class TemporalBranchTrainer_BC(BaseTrainer):
 
             # 2) attention scorer 
             attn_soft, raw_scores = self.attn_scorer(
-                chunk_emb,                      # (1,T,1)
-                temperature=self.temperature,   # adaptive τ
-                epoch=epoch)                    # phase-aware
-
+                chunk_emb,                               # (1,T,1)
+                temperature=self.temperature,            # τ  (phase-adaptive)
+                epoch=epoch,                             # epoch index
+            )                    
+            print(f"[DEBUG] Session {sid}  #chunks={T}, σ_running={self.attn_scorer.running_score_std.item():.3f}")
+            
             # 3) build α  – soft in Phase-0, ST-Top-K in Phase-1
-            if phase == 0:                                            # Phase-0
+            if phase == 0:                                              # Phase-0
                 alpha = attn_soft
-            if phase == 1:                           # Phase-1 ST-Top-K
+            elif phase == 1:                                              # Phase-1 ST-Top-K
                 if len(raw_scores.squeeze(0).squeeze(-1)) < 1:
                     print("Empty attention scores – skip this session")
                     continue
                 k  = min(T, max(6, int(T * self.top_k_ratio)))
-                alpha = straight_through_topk(raw_scores,
-                                            k=k,
-                                            tau=1.0, # self.temperature
-                                            use_entmax=(phase==1))
-            elif phase == 2:
-                if len(raw_scores.squeeze(0).squeeze(-1)) < 1:
-                    print("Empty attention scores – skip this session")
-                    continue
-                k  = min(T, max(6, int(T * self.top_k_ratio)))
-                alpha = straight_through_topk(raw_scores,
-                                            k=k,
-                                            tau=1.0, # self.temperature
-                                            use_entmax=(phase==1))
+                alpha = straight_through_topk(raw_scores, k=k)
             else:
                 alpha = attn_soft
 
@@ -711,7 +700,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
             if contrastive_term is None:
                 print("⚠️  Skip batch (no positive pairs)")
                 return None
-            loss_total = contrastive_term_scaled
+            loss_total = contrastive_term_scaled + self.lambda_ent * sparsity_loss
         elif phase == 1:
             loss_total = chunk_ce_loss_scaled
         else:                              # phase 2
@@ -869,7 +858,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
                 chunk_ce_total += train_chunk_ce
 
                 # === GRADIENT CHECK ===
-                if idx % 30 == 0:
+                if idx % 20 == 0:
                     modules = [
                         # ("Encoder", self.encoder),
                         ("Temporal", self.temporal_branch),

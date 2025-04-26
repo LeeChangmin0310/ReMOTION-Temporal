@@ -15,7 +15,7 @@ from unsupervised_encoders.unsupervised_predictor import unsupervised_predict
 from dataset import data_loader
 from dataset.data_loader.collate_fn import custom_collate_fn
 
-num_workers = 4
+num_workers = 0
 
 RANDOM_SEED = 100
 torch.manual_seed(RANDOM_SEED)

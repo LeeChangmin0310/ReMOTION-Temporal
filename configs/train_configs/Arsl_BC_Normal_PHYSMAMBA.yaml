@@ -1,7 +1,7 @@
 BASE: ['']
 ReMOTION_MODE: "train_and_test" # "train_and_test"  or "only_test"
 TRAIN:
-  BATCH_SIZE: 4
+  BATCH_SIZE: 8
   EPOCHS: 50
   LR: 3e-4
   MODEL_FILE_NAME: Arsl_BC_PhysMamba_Normal_TemporalBranch

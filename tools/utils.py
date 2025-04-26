@@ -140,22 +140,16 @@ def run_tsne_and_plot(self, level="chunk", epoch=0, phase="train"):
         self.session_labels_for_tsne.clear()
 
 # --- Utility
-def straight_through_topk(
-        scores: torch.Tensor,
-        k: int,
-        tau: float = 1.0,
-        use_entmax: bool = True):
+def straight_through_topk(probs: torch.Tensor, k: int):
     """
     Forward : hard 1/0 Top-K mask
     Backward: soft probs (Entmax or Softmax) for gradient
     """
-    if use_entmax:
-        probs = entmax.entmax15(scores / tau, dim=1)   # sparse soft
-    else:
-        probs = torch.softmax(scores / tau, dim=1)     # dense soft
-
+    # 1) hard Top-K (forward)
     _, top_idx = torch.topk(probs, k=k, dim=1)
     hard = torch.zeros_like(probs).scatter_(1, top_idx, 1.0)
+    
+    # 2) ST-trick : hard forward, soft grads
     return (hard - probs).detach() + probs
 
 
@@ -258,8 +252,8 @@ class SupConLossTopK(nn.Module):
         """
         # Phase 1: Warm-up (0 ~ 19)
         if epoch < 20:
-            self.max_pos = 12
-            self.max_neg = 60
+            self.max_pos = 6
+            self.max_neg = 24
             self.pos_neg_ratio = 1.0
 
         # Phase 2: Ramp-up (20 ~ 34)
