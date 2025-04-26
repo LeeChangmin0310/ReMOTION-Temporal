@@ -328,7 +328,6 @@ class TemporalBranchTrainer_BC(BaseTrainer):
         self.attn_scorer = AttnScorer(
             input_dim=config.MODEL.EMOTION.TEMPORAL_EMBED_DIM
         ).to(self.device)
-        self.lambda_ent = 0.1 # for sparsity loss
         
         # ------------------------------ Projection Head -------------------------------
         """Maps chunk embeddings to a projection space for contrastive learning"""
@@ -370,12 +369,9 @@ class TemporalBranchTrainer_BC(BaseTrainer):
         # -------------------------------- Loss Functions -------------------------------
         """SupConLossTopK: supervised contrastive loss using top-K attended chunks per session"""
         self.contrastive_loss_fn = SupConLossTopK(temperature=0.1)
-        self.contrastive_weight = 1.0
-        self.top_k_ratio = 0.5
         
         """CrossEntropyLoss: standard cross-entropy loss for classification"""
         self.criterion = nn.CrossEntropyLoss() # <================================ HOW ABOUT FOCAL LOSS???
-        self.ce_weight = 0.0
         
         """
         AlignCosineLoss: cosine distance between Top-K pooled vs Gated pooled embeddings.
@@ -399,9 +395,9 @@ class TemporalBranchTrainer_BC(BaseTrainer):
         self.best_chunk_ce_loss = float('inf')
         self.best_val_loss = float('inf')
         self.best_epoch = 0
-        self.best_val_acc = 0.0
-        self.best_val_f1 = 0.0
-        self.best_val_metric = 0.0
+        self.best_val_acc_phase = [0.0 for _ in range(3)]     # Phase 0,1,2
+        self.best_val_f1_phase = [0.0 for _ in range(3)]
+        self.best_val_metric_phase = [0.0 for _ in range(3)]
         self.avg_entropy_attn = None
         
         self.train_losses = []
@@ -457,11 +453,12 @@ class TemporalBranchTrainer_BC(BaseTrainer):
             phase, lr, wd, t_max = 0, 3e-4, 1e-4, 20
             
             # ① SupCon λ : 0-4 (1→0.6) , 5-19 (0.6→0.3)
-            if   epoch <= 4:
-                self.contrastive_weight = 1.0 - 0.1 * epoch          # 1.0→0.6
+            if  epoch < 10:
+                self.contrastive_weight = 1.0 - 0.05 * epoch        # 1.0→0.55
             else:
-                self.contrastive_weight = 0.6 - 0.3 * (epoch-4)/15  # 0.6→0.3
+                self.contrastive_weight = 0.55 - 0.02 * (epoch-10)  # 0.55→0.35
             self.contrastive_weight = max(0.3, self.contrastive_weight)
+            self.lambda_ent      = 0.05 # for sparsity loss
             self.chunk_ce_weight = 0.0
             self.ce_weight       = 0.0
             
@@ -481,14 +478,16 @@ class TemporalBranchTrainer_BC(BaseTrainer):
                 self.chunk_ce_weight = 0.25
             else:
                 self.chunk_ce_weight = 0.35 + 0.025 * (epoch-25)      # 0.35→0.60
-            self.chunk_ce_weight = min(0.60, self.chunk_ce_weight)
             self.contrastive_weight = 0.0
+            self.lambda_ent         = 0.0
+            self.chunk_ce_weight    = min(0.60, self.chunk_ce_weight)
             self.ce_weight          = 0.0
             self.temperature        = 1.0         # fixed
         
         # ───────────────────── Phase-2 ─────────────────────
         else:                          
             phase, lr, wd, t_max = 2, 1e-4, 5e-5, 10
+            self.lambda_ent         = 0.0
             self.contrastive_weight = 0.0
             self.chunk_ce_weight    = 0.0
             self.ce_weight          = 1.0
@@ -597,7 +596,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
             # ────────────────────────────────────────────────
 
             # 2) attention scorer 
-            attn_soft, raw_scores = self.attn_scorer(
+            attn_soft, raw_scaled = self.attn_scorer(
                 chunk_emb,                               # (1,T,1)
                 temperature=self.temperature,            # τ  (phase-adaptive)
                 epoch=epoch,                             # epoch index
@@ -605,15 +604,16 @@ class TemporalBranchTrainer_BC(BaseTrainer):
             print(f"[DEBUG] Session {sid}  #chunks={T}, σ_running={self.attn_scorer.running_score_std.item():.3f}")
             
             # 3) build α  – soft in Phase-0, ST-Top-K in Phase-1
-            if phase == 0:                                              # Phase-0
-                alpha = attn_soft
-            elif phase == 1:                                              # Phase-1 ST-Top-K
-                if len(raw_scores.squeeze(0).squeeze(-1)) < 1:
+            if phase == 1: # Phase-1 ST-Top-K
+                if len(raw_scaled.squeeze(0).squeeze(-1)) < 1:
                     print("Empty attention scores – skip this session")
                     continue
                 k  = min(T, max(6, int(T * self.top_k_ratio)))
-                alpha = straight_through_topk(raw_scores, k=k)
-            else:
+                alpha_mask = straight_through_topk(raw_scaled, k=k) # (1, T)
+                mask_bool  = alpha_mask.squeeze(0).bool()           # (T,)
+                alpha = alpha_mask.unsqueeze(-1)                    # (1,T,1)
+                print(f"[DEBUG] Top-K selected = {mask_bool.sum().item()} / {T}")
+            else:          # Phase-0 softmax or Phase-2 raw scores
                 alpha = attn_soft
 
             # 4) apply α before projection  (keeps grad path)
@@ -628,7 +628,6 @@ class TemporalBranchTrainer_BC(BaseTrainer):
 
             # 5-B) Top-K chunk CE  (Phase-1)
             if phase == 1:
-                mask_bool = alpha.squeeze(0).bool()                   # (T,)
                 topk_emb  = chunk_emb.squeeze(0)[mask_bool]           # (K,D)
                 topk_logits = self.chunk_aux_classifier(topk_emb)
                 topk_labels = torch.full((len(topk_logits),), label,
@@ -637,7 +636,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
 
             # 6) session-level pooling
             pooled, attn_gated, ent_gated = self.pooling(
-                gated_emb, raw_scores, return_weights=True, return_entropy=True)
+                gated_emb, raw_scaled, return_weights=True, return_entropy=True)
             # ★──────── session-level t-SNE ───────────────────
             sess_emb = pooled.squeeze(0)                              # (D,)
             self.session_embeddings_for_tsne.append(sess_emb.detach().cpu().numpy())
@@ -900,27 +899,27 @@ class TemporalBranchTrainer_BC(BaseTrainer):
             val_loss, metrics = self.valid(data_loader, epoch=epoch)
             self.val_losses.append(val_loss)
 
-            # Save by highest accuracy
-            if metrics['accuracy'] > self.best_val_acc:
-                self.best_val_acc = metrics['accuracy']
-                self.best_epoch = epoch
-                self.save_model(epoch=epoch, val_loss=val_loss, train_loss=avg_loss, val_metrics=metrics, tag="best_acc")
-                print(f"[SAVE] Best ACC model updated at epoch {epoch}")
+            # Save by highest accuracy, F1, sum of metrics (ACC + F1) per phase
+            phase_tag = f"phase{phase}"
+            
+            # Save by highest accuracy per phase
+            if metrics['accuracy'] > self.best_val_acc_phase[phase]:
+                self.best_val_acc_phase[phase] = metrics['accuracy']
+                self.save_model(epoch=epoch, val_loss=val_loss, train_loss=avg_loss, val_metrics=metrics, tag=f"best_acc_{phase_tag}")
+                print(f"[SAVE] Best ACC model updated at epoch {epoch} ({phase_tag})")
 
-            # Save by highest F1
-            if metrics['f1'] > self.best_val_f1:
-                self.best_val_f1 = metrics['f1']
-                self.best_epoch = epoch
-                self.save_model(epoch=epoch, val_loss=val_loss, train_loss=avg_loss, val_metrics=metrics, tag="best_f1")
-                print(f"[SAVE] Best F1 model updated at epoch {epoch}")
+            # Save by highest F1 per phase
+            if metrics['f1'] > self.best_val_f1_phase[phase]:
+                self.best_val_f1_phase[phase] = metrics['f1']
+                self.save_model(epoch=epoch, val_loss=val_loss, train_loss=avg_loss, val_metrics=metrics, tag=f"best_f1_{phase_tag}")
+                print(f"[SAVE] Best F1 model updated at epoch {epoch} ({phase_tag})")
 
-            # Save by best sum of metrics (Acc + F1)
-            if metrics['f1'] + metrics['accuracy'] > self.best_val_metric:
-                self.best_val_metric = metrics['f1'] + metrics['accuracy']
-                self.best_epoch = epoch
-                self.save_model(epoch=epoch, val_loss=val_loss, train_loss=avg_loss, val_metrics=metrics, tag="best_metric")
-                print(f"[SAVE] Best Metric model updated at epoch {epoch}")
-
+            # Save by best sum of metrics (Acc + F1) per phase
+            if metrics['f1'] + metrics['accuracy'] > self.best_val_metric_phase[phase]:
+                self.best_val_metric_phase[phase] = metrics['f1'] + metrics['accuracy']
+                self.save_model(epoch=epoch, val_loss=val_loss, train_loss=avg_loss, val_metrics=metrics, tag=f"best_metric_{phase_tag}")
+                print(f"[SAVE] Best Metric model updated at epoch {epoch} ({phase_tag})")
+                            
             # Save by lowest validation loss
             if val_loss < self.best_val_loss:
                 self.best_val_loss = val_loss
@@ -987,7 +986,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
                     losses.append(loss.item())
 
                     # Retrieve entropy from reconstruct_sessions
-                    entropy_val = session_entropies.get(sid, torch.tensor(0.0)).item()
+                    entropy_val = session_entropies[sid].item()
                     entropies.append(entropy_val)
 
                     prob = torch.softmax(outputs, dim=1).detach().cpu().numpy()[0]
@@ -1029,9 +1028,23 @@ class TemporalBranchTrainer_BC(BaseTrainer):
         self.eval_mode()
 
         base_name = self.config.TRAIN.MODEL_FILE_NAME
-        tags = ["best_acc", "best_f1", "best_metric", "best_loss", 
-                "best_ce_loss", "best_chunkce", "last_epoch"]
         results = {}
+        
+        # Best ACC/F1/Metric models per phase 0,1,2
+        phase_tags = []
+        for phase in range(3):
+            phase_tags += [
+                f"best_acc_phase{phase}",
+                f"best_f1_phase{phase}",
+                f"best_metric_phase{phase}"
+            ]
+    
+        # common models (best valid/ce/chunk_ce loss, total best, last epoch)
+        common_tags = [
+            "best_loss", "best_ce_loss", "best_chunkce", "last_epoch"
+        ]
+    
+        tags = phase_tags + common_tags
 
         for tag in tags:
             model_path = os.path.join("./saved_models", f"{base_name}_{tag}.pth")
@@ -1050,7 +1063,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
                 tbar = tqdm(data_loader["test"], desc=f"Test-{tag}", ncols=80)
                 for idx, batch in enumerate(tbar):
                     session_emb_dict, session_label_dict, session_entropies = self.reconstruct_sessions(
-                        batch=batch, idx=idx, phase='test'
+                        batch=batch, idx=idx, epoch=self.max_epoch, phase='test'
                     )
 
                     for sid, emb in session_emb_dict.items():
@@ -1112,7 +1125,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
             train_loss (float, optional): Training loss at this epoch.
             val_loss (float, optional): Validation loss at this epoch.
             val_metrics (dict, optional): Validation metrics such as accuracy, F1, etc.
-            tag (str): best_acc, best_f1, best_loss, best_metric
+            tag (str): Tag for saved model, e.g., best_acc, best_f1, etc.
         """
         model_save_dir = "./saved_models"
         os.makedirs(model_save_dir, exist_ok=True)
@@ -1121,9 +1134,11 @@ class TemporalBranchTrainer_BC(BaseTrainer):
         # === Save all modules ===
         model_dict = {
             "temporal_branch": self.temporal_branch.state_dict(),
-            "attention_pooling": self.pooling.state_dict(),
-            "classifier": self.classifier.state_dict(),
+            "attn_scorer": self.attn_scorer.state_dict(),
             "projection_head": self.chunk_projection.state_dict(),
+            "chunk_aux_classifier": self.chunk_aux_classifier.state_dict(),
+            "gated_pooling": self.pooling.state_dict(),
+            "classifier": self.classifier.state_dict(),
         }
         model_path = os.path.join(model_save_dir, f"{base_name}_{tag}.pth")
         torch.save(model_dict, model_path)
@@ -1155,16 +1170,18 @@ class TemporalBranchTrainer_BC(BaseTrainer):
     def load_best_model(self, path):
         """
         Load the best model weights from a saved checkpoint.
-        This includes TemporalBranch, AttentionPooling, Classifier, and ProjectionHead.
-
-        Args:
-            path (str): Path to the .pth file containing the saved model weights.
+        This includes TemporalBranch, AttentionScorer, ChunkProjection, 
+        ChunkAuxClassifier, GatedPooling, and Classifier.
         """
         checkpoint = torch.load(path, map_location=self.device)
+        
         self.temporal_branch.load_state_dict(checkpoint["temporal_branch"])
-        self.pooling.load_state_dict(checkpoint["attention_pooling"])
-        self.classifier.load_state_dict(checkpoint["classifier"])
+        self.attn_scorer.load_state_dict(checkpoint["attn_scorer"])
         self.chunk_projection.load_state_dict(checkpoint["projection_head"])
+        self.chunk_aux_classifier.load_state_dict(checkpoint["chunk_aux_classifier"])
+        self.pooling.load_state_dict(checkpoint["gated_pooling"])
+        self.classifier.load_state_dict(checkpoint["classifier"])
+        
         print(f"[LOAD] Best model loaded from: {path}")
 
     def plot_losses_and_lrs(self):

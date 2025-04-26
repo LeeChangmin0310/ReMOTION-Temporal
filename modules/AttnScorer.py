@@ -61,13 +61,13 @@ class AttnScorer(nn.Module):
         self._update_running_std(raw_scores.detach().std().item())
         sigma = self.running_score_std.item()
 
-        sigma_star = 1.2 if epoch < 20 else 1.5               # target σ*
+        sigma_star = 0.8 if epoch < 12 else 1.2               # target σ*
         gamma      = (sigma_star / (sigma + 1e-4))
-        gamma      = float(max(0.5, min(3.0, gamma)))         # clamp
+        gamma      = float(max(0.5, min(2.0, gamma)))         # clamp
         raw_scaled = raw_scores * gamma                       # scale
         
         # --- choose attention kernel ----------------------
-        if epoch < 5:                                               # Phase 0-a:  Softmax explore
+        if epoch < 10:                                               # Phase 0-a:  Softmax explore
             attn = torch.softmax(raw_scaled / temperature, dim=1)
         
         elif epoch < 20:                                            # Phase 0-b:  α-Entmax warm-up
@@ -86,16 +86,4 @@ class AttnScorer(nn.Module):
                   f"→ γ={gamma:.2f} | kernel={('soft','α','15','raw')[min(3,epoch//15)]}")
 
         
-        return attn, raw_scores
-        
-        """
-        attn_scores = F.softmax(scores / self.temperature, dim=1) # Apply softmax across time (T) with temperature scaling: (B, T, 1)
-
-        if return_entropy:
-            entropy = -torch.sum(attn_scores * torch.log(attn_scores + 1e-8), dim=1).mean()
-            return attn_scores, entropy
-        else:
-            return attn_scores # These scores are only used to rank/select Top-K chunks; not used for pooling.
-        """
-        
-        
+        return attn, raw_scaled

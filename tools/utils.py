@@ -49,30 +49,22 @@ def reconstruct_sessions(self, batch=None, idx=None, epoch=None, phase="train"):
             self.chunk_labels_for_tsne.append(label)
 
         # === Attention ===
-        _, raw_scores = self.attn_scorer(chunk_embeds)  # (1, T, 1)
-        pooled, attn_weights, entropy = self.pooling(chunk_embeds, raw_scores, return_weights=True, return_entropy=True)
-        if epoch < 10: # Phase 0.0
-            attn_weights = F.softmax(raw_scores / self.temperature, dim=1)
+        attn_weights, raw_scores = self.attn_scorer(chunk_embeds, temperature=self.temperature, epoch=epoch)  # (1, T, 1)
+        pooled, attn_gated, entropy_gated = self.pooling(chunk_embeds, raw_scores, return_weights=True, return_entropy=True)
+        if attn_weights is not None:
             entropy = -torch.sum(attn_weights * torch.log(attn_weights + 1e-8), dim=1).mean()
-        elif 10 <= epoch < 35: # Phase 0.5 and 1
-            attn_weights = entmax.entmax15(raw_scores, dim=1)
-            entropy = -torch.sum(attn_weights * torch.log(attn_weights + 1e-8), dim=1).mean()
-        else: # Phase 2
-            pass
-
-        if phase in ['train', 'valid']:
-            if epoch <= 34:
-                attn_np = attn_weights.detach().cpu().squeeze().numpy()
-                print(f"[DEBUG][SupCon Attention Weights] {attn_np.tolist()}")
-                print(f"[DEBUG][SupCon Attn Sparsity] mean={attn_np.mean():.4f}, std={attn_np.std():.4f}, entropy={entropy.item():.4f}")
-            else:
-                attn_np = attn_weights.detach().cpu().squeeze().numpy()
-                print(f"[DEBUG][Gated Attention Weights] {attn_np.tolist()}")
-                print(f"[DEBUG][GatedAttn Sparsity] mean={attn_np.mean():.4f}, std={attn_np.std():.4f}, entropy={entropy.item():.4f}")
         else:
-            attn_np = attn_weights.detach().cpu().squeeze().numpy()
-            print(f"[DEBUG][Gated Attention Weights] {attn_np.tolist()}")
-            print(f"[DEBUG][GatedAttn Sparsity] mean={attn_np.mean():.4f}, std={attn_np.std():.4f}, entropy={entropy.item():.4f}")
+            attn_weights = attn_gated
+            entropy = entropy_gated
+            
+        attn_np = attn_weights.detach().cpu().squeeze().numpy()
+        if phase in ['train', 'valid']:
+            if epoch <= 34: # valid, phase0 and phase1
+                print(f"[DEBUG][AttnScorer Weights] {attn_np.tolist()}")
+                print(f"[DEBUG][AttnScorer Sparsity] mean={attn_np.mean():.4f}, std={attn_np.std():.4f}, entropy={entropy.item():.4f}")
+        else: # test and phase 2
+            print(f"[DEBUG][GatedPooling Weights] {attn_np.tolist()}")
+            print(f"[DEBUG][GatedPooling Sparsity] mean={attn_np.mean():.4f}, std={attn_np.std():.4f}, entropy={entropy.item():.4f}")
 
         # for t-SNE
         self.session_embeddings_for_tsne.append(pooled.detach().cpu().numpy())
@@ -140,17 +132,30 @@ def run_tsne_and_plot(self, level="chunk", epoch=0, phase="train"):
         self.session_labels_for_tsne.clear()
 
 # --- Utility
-def straight_through_topk(probs: torch.Tensor, k: int):
+def straight_through_topk(raw_scores: torch.Tensor, k: int, soft_branch: str = "entmax15"):
     """
     Forward : hard 1/0 Top-K mask
     Backward: soft probs (Entmax or Softmax) for gradient
+    Args:
+        raw_scores : (B,T,1)  –  logit or pre-score
+        k          : Top-K
+        soft_fn    : softmax  or  partial(entmax15)
     """
-    # 1) hard Top-K (forward)
-    _, top_idx = torch.topk(probs, k=k, dim=1)
+    B, T, _ = raw_scores.shape
+    logits  = raw_scores.view(B, T)
+
+    # ---- soft branch (∂L/∂logits) -----------------------------------------
+    if soft_branch == "entmax15":
+        probs = entmax.entmax15(logits, dim=1)
+    else:
+        probs = torch.softmax(logits, dim=1)
+
+    # ---- hard branch (forward only) ---------------------------------------
+    _, top_idx = torch.topk(logits, k=min(k, T), dim=1)
     hard = torch.zeros_like(probs).scatter_(1, top_idx, 1.0)
-    
-    # 2) ST-trick : hard forward, soft grads
-    return (hard - probs).detach() + probs
+
+    # ---- straight-through --------------------------------------------------
+    return (hard - probs).detach() + probs         # (B,T)
 
 
 
