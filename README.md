@@ -1,111 +1,197 @@
-## ✅ Finalized Emotion Recognition Training Pipeline: Schedule & Rationale
+# From Raw rPPG Chunks to Emotion Recognition: Learning Temporal Representations via Exploration and Exploitation
+
+This project **extends** the open-source [rPPG-Toolbox](https://github.com/ubicomplab/rPPG-Toolbox),
+creating a **phase-aware, end-to-end representation-focused emotion recognition pipeline**.
 
 ---
 
-### 🧠 High-Level Goal
-Train a TemporalBranch-based emotion recognition model from chunked rPPG signals using a three-phase strategy:
+# 1. 📈 Final Training Pipeline Overview
 
-1. **Warm-up (Epoch 0–19)**:
-   - Focus: Representation learning via contrastive learning.
-   - Key: Diversity in chunk embedding using soft attention.
-2. **Ramp-up (Epoch 20–44)**:
-   - Focus: Transition from contrastive to CE loss.
-   - Key: Gradual introduction of CE loss, SupCon decays, dual attention alignment.
-3. **Fine-tuning (Epoch 45–50)**:
-   - Focus: CE-based final classification stability.
-   - Key: SupCon nearly off, attention stabilized, classifier final tuning.
+| Phase | Input ➔ Module Flow | Attention Type | Loss Used | Purpose | Key Modules | Loss Weight |
+|:-----:|:----------------------|:--------------|:---------|:--------|:------------|:------------|
+| Phase 0 (epoch 0–9) | rPPG ➔ TemporalBranch ➔ AttnScorer ➔ Softmax ➔ Projection ➔ SupConLoss | Softmax (w/ temperature) | SupConLoss, SparsityLoss | Early exploration (diversity) | TemporalBranch, AttnScorer, ProjectionHead | `contrastive_weight`, `sparsity_weight` |
+| Phase 0 (epoch 10–19) | rPPG ➔ TemporalBranch ➔ AttnScorer ➔ α-Entmax (α 1.9→1.6) ➔ Projection ➔ SupConLoss | α-Entmax | SupConLoss, SparsityLoss | Sparse attention learning | TemporalBranch, AttnScorer, ProjectionHead | `contrastive_weight`, `sparsity_weight` |
+| Phase 1 (epoch 20–34) | rPPG ➔ TemporalBranch ➔ AttnScorer ➔ Entmax15 ➔ Top-K Selection ➔ ChunkAuxClassifier | Entmax15 | Chunk-level CE | Chunk-level discriminativity | TemporalBranch, AttnScorer, ChunkAuxClassifier | `chunk_ce_weight` |
+| Phase 2 (epoch 35–end) | rPPG ➔ TemporalBranch ➔ AttnScorer ➔ Softmax ➔ GatedPooling ➔ Classifier | Softmax | Session-level CE | Stable final classification | TemporalBranch, AttnScorer, GatedPooling, Classifier | `ce_weight` |
 
 ---
 
-### 📅 Phase-wise Loss & Module Schedule
+# 2. 🚀 Phase-by-Phase Learning Flow
 
-| Epoch Range | Active Losses                      | Weight Schedule                                 | Purpose                                     |
-|-------------|-------------------------------------|--------------------------------------------------|---------------------------------------------|
-| 0–19        | SupConLossTopK, Sparsity           | SupCon=1.0, Sparsity=0.3                        | Learn diverse chunk embedding               |
-| 20–44       | SupCon, CE, Sparsity, Align, ChunkCE| SupCon=1.0→0.05, CE=0.0→1.0, Sparsity=0.3→0.05  | Transfer to session-level supervised learning |
-| 45–50       | CE only (optional Align retained)  | CE=1.0, Sparsity=0.05, SupCon=0.05 (or 0.0)     | Stable CE classification                    |
+## Phase 0: Diversity-first Exploration
 
----
-
-### 🧩 Module Activation Schedule
-
-| Module                | Active Epochs | Purpose                                                 |
-|-----------------------|----------------|----------------------------------------------------------|
-| TemporalBranch        | 0–50           | Always learn discriminative chunk embedding              |
-| AttnScorer            | 0–34 (trainable), 35–50 (frozen) | Learn attention for SupCon chunk selection              |
-| ChunkProjection       | 0–34           | Learn projection for SupConLoss                         |
-| GatedPooling          | 15–50          | Aggregate chunks with gated self-attention for CE       |
-| Classifier            | 30–50          | Final session-level classification                      |
-| ChunkAuxClassifier    | 20–34          | Provide weak supervision at chunk-level (soft CE)       |
-| TopKsSoftPooling      | 20–50          | Pooled representation from AttnScorer Top-K for KL align|
+- **Epoch 0–9**:
+  - Attention: Softmax
+  - Loss: SupConLoss, SparsityLoss
+  - Goal: Maximize embedding diversity
+- **Epoch 10–19**:
+  - Attention: α-Entmax (α → 1.6)
+  - Loss: SupConLoss, SparsityLoss
+  - Goal: Sparse, selective attention focusing
 
 ---
 
-### 🎯 Loss Function Details
+## Phase 1: Chunk-level Discriminativity (Weak Supervision)
 
-| Loss Type         | Description                                                                 |
-|-------------------|-----------------------------------------------------------------------------|
-| SupConLossTopK    | Supervised contrastive loss using attention-scored Top-K chunk projection   |
-| CE Loss           | Standard CrossEntropyLoss on GatedPooling output                            |
-| Sparsity Loss     | Entropy-based loss to prevent overly sparse attention                       |
-| Chunk-level CE    | Weak label CE loss using same label across all chunks in a session          |
-| Align Loss (KL)   | KL divergence between Top-K pooled output vs Gated pooled output logits     |
+- **Epoch 20–34**:
+  - Attention: Entmax15
+  - Action: Top-K selection based on raw scores
+  - Loss: Chunk-level CE Loss
+  - Goal: Train discriminative chunk embeddings
 
 ---
 
-### 🔁 Top-K Selection Strategy
+## Phase 2: Session-level Final Classification
 
-| Epoch Range | Method              | Notes                                               |
-|-------------|---------------------|-----------------------------------------------------|
-| 0–10        | Softmax             | Encourage exploration and diversity                 |
-| 11–19       | Entmax15            | Focus on sparse informative chunks                 |
-| 20–34       | Top-K + Threshold   | Hard discriminative selection for SupCon           |
-| 35–50       | (Optional) Top-K (frozen Attn) or None | SupCon off/frozen                            |
-
----
-
-### 🧪 Temperature & Threshold Scheduling (in `train()`)
-
-| Component         | Adjusted by       | Goal                                                   |
-|-------------------|-------------------|--------------------------------------------------------|
-| AttnScorer        | Entropy moving avg| Control attention sharpness (T ≈ 0.3 × entropy)        |
-| GatedPooling      | Entropy moving avg| Stabilize CE-side attention (T ≈ 0.5 × entropy)        |
-| TopKsSoftPooling  | Optional fixed T  | Smooth KL-align pooling, T ≈ 0.5 or constant           |
-| Threshold         | 0.01 + α × (1 - entropy) | Avoid over-pruning in Top-K selection        |
+- **Epoch 35–end**:
+  - Attention: Softmax
+  - Aggregation: GatedPooling
+  - Loss: Session-level CE Loss
+  - Goal: Stable final classification
 
 ---
 
-### ✅ Summary of Design Intent
+# 3. 🧬 Model Architecture Flow
 
-- **Representation First**: Train TemporalBranch and AttnScorer early to learn discriminative representations.
-- **Attention Modulation**: Transition from soft → sparse → hard attention for robust chunk selection.
-- **Loss Separation**: Each loss has distinct timing and gradient paths to avoid interference.
-- **Classifier Stability**: Activate CE + Classifier only when the embedding space is sufficiently shaped.
-- **Dual Attention Stream**: AttnScorer (SupCon) and GatedPooling (CE) are aligned but separated.
-- **KL Alignment**: Softly match Top-K selected representation with CE-side representation post ramp-up.
+```
+rPPG (chunk)
+    ➔ TemporalBranch (Multi-Scale Temporal Feature Extractor)
+    ➔ AttnScorer (Chunk Attention Scorer)
+    ➔
+    ├── (Phase 0,1) ➔ Attention-Weighted Projection ➔ SupConLoss
+    ├── (Phase 1) ➔ Top-K Selection ➔ ChunkAuxClassifier ➔ Chunk-level CE
+    └── (Phase 2) ➔ GatedPooling ➔ Session-level Classifier ➔ Session-level CE
+```
 
-This structure ensures that early training builds diversity and mid-to-late training focuses on classification and alignment stability. You can now proceed to finalize the `train()` and `valid()` implementations and loss visualizations accordingly.
+---
+
+# 4. 🛠️ Key Modules
+
+| Module | Role | Description |
+|:------:|:----:|:-----------|
+| TemporalBranch | Feature Extraction | Multi-scale temporal feature extractor for rPPG chunks |
+| AttnScorer | Attention Scorer | Computes attention weights per chunk |
+| ProjectionHead | Projection for SupCon | Projects embeddings before contrastive learning |
+| ChunkAuxClassifier | Chunk-level Classifier | Weak supervision on Top-K chunks |
+| GatedPooling | Session Aggregator | Soft attention aggregation for session embedding |
+| Classifier | Session Classifier | Final emotion prediction from session embedding |
+
+---
+
+# 5. 🌟 Loss Functions
+
+| Loss | Phase | Purpose |
+|:----:|:-----:|:-------|
+| SupConLossTopK | Phase 0 | Train diverse and separable representations |
+| SparsityLoss (Entropy) | Phase 0 | Regularize attention entropy |
+| Chunk-level CE Loss | Phase 1 | Supervise chunk-level discriminativity |
+| Session-level CE Loss | Phase 2 | Final session-level emotion classification |
+
+---
+
+# 6. 📂 Dataset
+
+We mainly use **MAHNOB-HCI** fro Emotion Recognition:
+
+- **Data Format**:
+  - Videos: `.avi` (NDHWC)
+  - Labels: `emotion_labels.csv`
+
+```
+MAHNOB_HCI_Emotion/
+  ├─ emotion_labels.csv
+  ├─ 2/
+  │    └─ 2.avi
+  ├─ 4/
+  │    └─ 4.avi
+  └─ ...
+```
+
+> **Dataset loading handled by `MAHNOBHCILoader`**
+> Data engineering might be needed depends on your emotion recognition task
+  - refer EDAandFiltering.ipynb
+
+---
+
+# 7. 📝 Citation
+
+If you use this work, cite **rPPG-Toolbox**:
+
+```bibtex
+@article{
+}
+```
+If you find our [paper]() or this toolbox useful for your research, please cite our work.
+
+---
+
+# 8. :wrench: Setup
+
+You can use either [`conda`](https://docs.conda.io/projects/conda/en/latest/user-guide/install/index.html) or [`uv`](https://docs.astral.sh/uv/getting-started/installation/) with this toolbox. Most users are already familiar with `conda`, but `uv` may be a bit less familiar - check out some highlights about `uv` [here](https://docs.astral.sh/uv/#highlights). If you use `uv`, it's highly recommended you do so independently of `conda`, meaning you should make sure you're not installing anything in the base `conda` environment or any other `conda` environment. If you're having trouble making sure you're not in your base `conda` environment, try setting `conda config --set auto_activate_base false`.
+
+STEP 1: `bash setup.sh conda` or `bash setup.sh uv` 
+
+STEP 2: `conda activate remotion` or, when using `uv`, `source .venv/bin/activate`
+
+NOTE: the above setup should work without any issues on machines using Linux or MacOS. If you run into compiler-related issues using `uv` when installing tools related to mamba, try checking to see if `clang++` is in your path using `which clang++`. If nothing shows up, you can install `clang++` using `sudo apt-get install clang` on Linux or `xcode-select --install` on MacOS.
+
+If you use Windows or other operating systems, consider using [Windows Subsystem for Linux](https://learn.microsoft.com/en-us/windows/wsl/install) and following the steps within `setup.sh` independently.
+
+---
+
+## :computer: Example of Using Pre-trained rPPG Models 
+
+Please use config files under `./configs/infer_configs`
+
+For example, if you want to run The model pre-trained on UBFC-rPPG and train on MAHNOB-HCI, use `python main.py --config_file ./configs/infer_configs/python main.py --config ./configs/train_configs/Arsl_BC_Normal_PHYSMAMBA.yaml`
+
+**(will be updated)**
+If you want to test unsupervised signal processing  methods, you can use `python main.py --config_file ./configs/infer_configs/UBFC-rPPG_UNSUPERVISED.yaml`
+
+## :computer: Examples of Neural Network Training
+
+Please use config files under `./configs/train_configs`
+
+### Training on MAHNOB-HCI
+
+STEP 1: Download the MAHNOB-HCI raw data by asking the [link](http://mahnob-db.eu/hci-tagging).
+
+STEP 2: Modify `./configs/train_configs/Arsl_BC_Normal_PHYSMAMBA.yaml` 
+
+STEP 3: Run `python main.py --config_file ./configs/train_configs/Arsl_BC_Normal_PHYSMAMBA.yaml` 
+
+Note 1: Preprocessing requires only once; thus turn it off on the yaml file when you train the network after the first time. 
+
+Note 2: The example yaml setting will allow 80% of MAHNOB-HCI to train and 10% of MAHNOB-HCI to valid. 
+After training, it will use the best model(with the least validation loss) to test on MAHNOB-HCI.
+
+## :zap: Inference With Unsupervised Methods **(will be updated)**
+
+STEP 1: Download the MAHNOB-HCI raw data by asking the [link](http://mahnob-db.eu/hci-tagging).
+
+STEP 2: Modify `./configs/infer_configs/MAHNOB-HCI_UNSUPERVISED_BC.yaml` 
+
+STEP 3: Run `python main.py --config_file ./configs/infer_configs/MAHNOB-HCI_UNSUPERVISED_BC.yaml`
+
+---
+
+# 9. 📝 License
+
+This work inherits the [Responsible AI License](https://www.licenses.ai/source-code-license)
+from the original rPPG-Toolbox.
+
+---
 
 
-<p align="center">
-:fire: Please remember to :star: this repo if you find it useful and cite our work if you end up using it in your work! :fire:
-</p>
-<p align="center">
-:fire: If you have any questions or concerns, please create an <a href="https://github.com/ubicomplab/rPPG-Toolbox/issues">issue</a> :memo:! :fire:
-</p>
+# + Additional Informations
 
+## :notebook: Algorithms
+***This repo currently supports the following algorithms as a feature extractor:***
 
+* Supervised Neural Algorithms 
+  - [PhysMamba: Efficient Remote Physiological Measurement with SlowFast Temporal Difference Mamba](https://doi.org/10.48550/arXiv.2409.12031), by Luo *et al.*, 2024
 
-
-**rPPG-Toolbox** is an open-source platform designed for camera-based physiological sensing, also known as remote photoplethysmography (rPPG). 
-
-
-rPPG-Toolbox not only benchmarks the **existing state-of-the-art neural and unsupervised methods**, but it also supports flexible and rapid development of your own algorithms.
-
-
-
-# :notebook: Algorithms
-rPPG-Toolbox currently supports the following algorithms: 
+This repo **will(or can) supports** the following algorithms as a feature extractor:
 
 * Traditional Unsupervised Algorithms
   - [Remote plethysmographic imaging using ambient light (GREEN)](https://pdfs.semanticscholar.org/7cb4/46d61a72f76e774b696515c55c92c7aa32b6.pdf?_gl=1*1q7hzyz*_ga*NTEzMzk5OTY3LjE2ODYxMDg1MjE.*_ga_H7P4ZT52H5*MTY4NjEwODUyMC4xLjAuMTY4NjEwODUyMS41OS4wLjA), by Verkruysse *et al.*, 2008
@@ -126,11 +212,10 @@ rPPG-Toolbox currently supports the following algorithms:
  (BigSmall)](https://arxiv.org/abs/2303.11573), by Narayanswamy *et al.*, 2023
   - [PhysFormer: Facial Video-based Physiological Measurement with Temporal Difference Transformer (PhysFormer)](https://openaccess.thecvf.com/content/CVPR2022/papers/Yu_PhysFormer_Facial_Video-Based_Physiological_Measurement_With_Temporal_Difference_Transformer_CVPR_2022_paper.pdf), by Yu *et al.*, 2022
   - [iBVPNet: 3D-CNN architecture introduced in iBVP dataset paper](https://doi.org/10.3390/electronics13071334), by Joshi *et al.*, 2024
-  - [PhysMamba: Efficient Remote Physiological Measurement with SlowFast Temporal Difference Mamba](https://doi.org/10.48550/arXiv.2409.12031), by Luo *et al.*, 2024
   - [RhythmFormer: Extracting rPPG Signals Based on Hierarchical Temporal Periodic Transformer](https://doi.org/10.48550/arXiv.2402.12788), by Zou *et al.*, 2024
 
-# :file_folder: Datasets
-The toolbox supports seven datasets, namely SCAMPS, UBFC-rPPG, PURE, BP4D+, UBFC-Phys, MMPD and iBVP. Please cite the corresponding papers when using these datasets. For now, we recommend training with UBFC-rPPG, PURE, iBVP or SCAMPS due to the level of synchronization and volume of the datasets. **To use these datasets in a deep learning model, you should organize the files as follows.**
+## :file_folder: Datasets
+rPPG extractor's pretrained weights are trained from seven datasets, namely SCAMPS, UBFC-rPPG, PURE, BP4D+, UBFC-Phys, MMPD and iBVP. Please cite the corresponding papers when using these datasets. For now, we recommend training with UBFC-rPPG, PURE, iBVP or SCAMPS due to the level of synchronization and volume of the datasets. **To use these datasets in a deep learning model, you should organize the files as follows.**
 * [MMPD](https://github.com/McJackTang/MMPD_rPPG_dataset)
     * Jiankai Tang, Kequan Chen, Yuntao Wang, Yuanchun Shi, Shwetak Patel, Daniel McDuff, Xin Liu, "MMPD: Multi-Domain Mobile Video Physiology Dataset", IEEE EMBC, 2023
     -----------------
@@ -293,105 +378,16 @@ in: Proc. 23st IEEE Int. Symposium on Robot and Human Interactive Communication 
           |      |-- pii_x_bvp.csv
     -----------------
 
-## :bar_chart: Benchmarks
+---
 
-
-
-# :wrench: Setup
-
-You can use either [`conda`](https://docs.conda.io/projects/conda/en/latest/user-guide/install/index.html) or [`uv`](https://docs.astral.sh/uv/getting-started/installation/) with this toolbox. Most users are already familiar with `conda`, but `uv` may be a bit less familiar - check out some highlights about `uv` [here](https://docs.astral.sh/uv/#highlights). If you use `uv`, it's highly recommended you do so independently of `conda`, meaning you should make sure you're not installing anything in the base `conda` environment or any other `conda` environment. If you're having trouble making sure you're not in your base `conda` environment, try setting `conda config --set auto_activate_base false`.
-
-STEP 1: `bash setup.sh conda` or `bash setup.sh uv` 
-
-STEP 2: `conda activate rppg-toolbox` or, when using `uv`, `source .venv/bin/activate`
-
-NOTE: the above setup should work without any issues on machines using Linux or MacOS. If you run into compiler-related issues using `uv` when installing tools related to mamba, try checking to see if `clang++` is in your path using `which clang++`. If nothing shows up, you can install `clang++` using `sudo apt-get install clang` on Linux or `xcode-select --install` on MacOS.
-
-If you use Windows or other operating systems, consider using [Windows Subsystem for Linux](https://learn.microsoft.com/en-us/windows/wsl/install) and following the steps within `setup.sh` independently.
-
-# :computer: Example of Using Pre-trained Models 
-
-Please use config files under `./configs/infer_configs`
-
-For example, if you want to run The model trained on PURE and tested on UBFC-rPPG, use `python main.py --config_file ./configs/infer_configs/PURE_UBFC-rPPG_TSCAN_BASIC.yaml`
-
-If you want to test unsupervised signal processing  methods, you can use `python main.py --config_file ./configs/infer_configs/UBFC-rPPG_UNSUPERVISED.yaml`
-
-# :computer: Examples of Neural Network Training
-
-Please use config files under `./configs/train_configs`
-
-## Training on PURE and Testing on UBFC-rPPG With TSCAN 
-
-STEP 1: Download the PURE raw data by asking the [paper authors](https://www.tu-ilmenau.de/universitaet/fakultaeten/fakultaet-informatik-und-automatisierung/profil/institute-und-fachgebiete/institut-fuer-technische-informatik-und-ingenieurinformatik/fachgebiet-neuroinformatik-und-kognitive-robotik/data-sets-code/pulse-rate-detection-dataset-pure).
-
-STEP 2: Download the UBFC-rPPG raw data via [link](https://sites.google.com/view/ybenezeth/ubfcrppg)
-
-STEP 3: Modify `./configs/train_configs/PURE_PURE_UBFC-rPPG_TSCAN_BASIC.yaml` 
-
-STEP 4: Run `python main.py --config_file ./configs/train_configs/PURE_PURE_UBFC-rPPG_TSCAN_BASIC.yaml` 
-
-Note 1: Preprocessing requires only once; thus turn it off on the yaml file when you train the network after the first time. 
-
-Note 2: The example yaml setting will allow 80% of PURE to train and 20% of PURE to valid. 
-After training, it will use the best model(with the least validation loss) to test on UBFC-rPPG.
-
-## Training on SCAMPS and testing on UBFC-rPPG With DeepPhys
-
-STEP 1: Download the SCAMPS via this [link](https://github.com/danmcduff/scampsdataset) and split it into train/val/test folders.
-
-STEP 2: Download the UBFC-rPPG via [link](https://sites.google.com/view/ybenezeth/ubfcrppg)
-
-STEP 3: Modify `./configs/train_configs/SCAMPS_SCAMPS_UBFC-rPPG_DEEPPHYS_BASIC.yaml` 
-
-STEP 4: Run `python main.py --config_file ./configs/train_configs/SCAMPS_SCAMPS_UBFC-rPPG_DEEPPHYS_BASIC.yaml`
-
-Note 1: Preprocessing requires only once; thus turn it off on the yaml file when you train the network after the first time. 
-
-Note 2: The example yaml setting will allow 80% of SCAMPS to train and 20% of SCAMPS to valid. 
-After training, it will use the best model(with the least validation loss) to test on UBFC-rPPG.
-
-# :zap: Inference With Unsupervised Methods 
-
-STEP 1: Download the UBFC-rPPG via [link](https://sites.google.com/view/ybenezeth/ubfcrppg)
-
-STEP 2: Modify `./configs/infer_configs/UBFC_UNSUPERVISED.yaml` 
-
-STEP 3: Run `python main.py --config_file ./configs/infer_configs/UBFC_UNSUPERVISED.yaml`
-
-
-# :scroll: YAML File Setting
+## :scroll: YAML File Setting
 The rPPG-Toolbox uses yaml file to control all parameters for training and evaluation. 
 You can modify the existing yaml files to meet your own training and testing requirements.
 
 Here are some explanation of parameters:
-* #### TOOLBOX_MODE: 
+* #### ReMOTION_MODE: 
   * `train_and_test`: train on the dataset and use the newly trained model to test.
   * `only_test`: you need to set INFERENCE-MODEL_PATH, and it will use pre-trained model initialized with the MODEL_PATH to test.
-* #### TRAIN / VALID / TEST / UNSUPERVISED DATA:
-  * `PLOT_LOSSES_AND_LR`: If `True`, save plots of the training loss and validation loss, as well as the learning rate, to `LOG.PATH` (`runs/exp` by default). Currently, only a basic training loss and validation loss are plotted, but in the future additional losses utilized in certain trainer files (e.g., PhysFormer and BigSmall) will also be captured.
-  * `USE_EXCLUSION_LIST`: If `True`, utilize a provided list to exclude preprocessed videos
-  * `SELECT_TASKS`: If `True`, explicitly select tasks to load 
-  * `DATA_PATH`: The input path of raw data
-  * `CACHED_PATH`: The output path to preprocessed data. This path also houses a directory of .csv files containing data paths to files loaded by the dataloader. This filelist (found in default at CACHED_PATH/DataFileLists). These can be viewed for users to understand which files are used in each data split (train/val/test)
-  * `EXP_DATA_NAME` If it is "", the toolbox generates a EXP_DATA_NAME based on other defined parameters. Otherwise, it uses the user-defined EXP_DATA_NAME.  
-  * `BEGIN" & "END`: The portion of the dataset used for training/validation/testing. For example, if the `DATASET` is PURE, `BEGIN` is 0.0 and `END` is 0.8 under the TRAIN, the first 80% PURE is used for training the network. If the `DATASET` is PURE, `BEGIN` is 0.8 and `END` is 1.0 under the VALID, the last 20% PURE is used as the validation set. It is worth noting that validation and training sets don't have overlapping subjects.  
-  * `DATA_TYPE`: How to preprocess the video data
-  * `DATA_AUG`: If present, the type of generative data augmentation applied to video data
-  * `LABEL_TYPE`: How to preprocess the label data
-  *  `USE_PSUEDO_PPG_LABEL`: If `True` use POS generated PPG psuedo labels instead of dataset ground truth heart singal waveform
-  * `DO_CHUNK`: Whether to split the raw data into smaller chunks
-  * `CHUNK_LENGTH`: The length of each chunk (number of frames)
-  * `DO_CROP_FACE`: Whether to perform face detection
-  * `BACKEND`: Select which backend to use for face detection. Currently, the options are HC (Haar Cascade) or RF (RetinaFace). We recommend using Haar Cascade (the config default) in order to reproduce results from the [NeurIPS 2023 Datasets and Benchmarks paper](https://arxiv.org/abs/2210.00716) that corresponds to this toolbox. If you use RetinaFace, we recommend that you experiment with parameters such as `LARGE_BOX_COEF` and `USE_MEDIAN_BOX` depending on what dataset you are preprocessnig. We plan to update this README with optimal settings to use with RetinaFace in the near future.
-  * `DYNAMIC_DETECTION`: If `False`, face detection is only performed at the first frame and the detected box is used to crop the video for all of the subsequent frames. If `True`, face detection is performed at a specific frequency which is defined by `DYNAMIC_DETECTION_FREQUENCY`. 
-  * `DYNAMIC_DETECTION_FREQUENCY`: The frequency of face detection (number of frames) if DYNAMIC_DETECTION is `True`
-  * `USE_MEDIAN_FACE_BOX`: If `True` and `DYNAMIC_DETECTION` is `True`, use the detected face boxs throughout each video to create a single, median face box per video.
-  * `LARGE_FACE_BOX`: Whether to enlarge the rectangle of the detected face region in case the detected box is not large enough for some special cases (e.g., motion videos)
-  * `LARGE_BOX_COEF`: The coefficient to scale the face box if `LARGE_FACE_BOX` is `True`.
-  * `INFO`: This is a collection of parameters based on attributes of a dataset, such as gender, motion types, and skin color, that help select videos for inclusion in training, validation, or testing. Currently, only the [MMPD](https://github.com/McJackTang/MMPD_rPPG_dataset) dataset is supported for parameter-based video inclusion. Please refer to one of the config files involving the [MMPD](https://github.com/McJackTang/MMPD_rPPG_dataset) dataset for an example of using these parameters.
-  * `EXCLUSION_LIST`: A list that specifies videos to exclude, typically based on a unique identifier to a video such as the combination of a subject ID and a task ID. This is only used if `USE_EXCLUSION_LIST` is set to `True`. Currently this parameter is only tested with the [UBFC-Phys](https://sites.google.com/view/ybenezeth/ubfc-phys) dataset. Please refer to one of the config files involving the [UBFC-Phys](https://sites.google.com/view/ybenezeth/ubfc-phys) dataset for an example of using this parameter.
-  * `TASK_LIST`: A list to specify tasks to include when loading a dataset, allowing for selective inclusion of a subset of tasks or a single task in a dataset if desired. This is only used if `SELECT_TASKS` is set to `True`. Currently this parameter is only tested with the [UBFC-Phys](https://sites.google.com/view/ybenezeth/ubfc-phys) dataset. Please refer to one of the config files involving the [UBFC-Phys](https://sites.google.com/view/ybenezeth/ubfc-phys) dataset for an example of using this parameter.
 
   
 * #### MODEL : Set used model (Deepphys, TSCAN, Physnet, EfficientPhys, BigSmall, and PhysFormer and their paramaters are supported).
@@ -402,7 +398,7 @@ Here are some explanation of parameters:
   * `USE_SMALLER_WINDOW`: If `True`, use an evaluation window smaller than the video length for evaluation.
 
     
-# :open_file_folder: Adding a New Dataset
+## :open_file_folder: Adding a New Dataset
 
 * STEP 1: Create a new python file in `dataset/data_loader`, e.g. MyLoader.py
 
@@ -423,11 +419,11 @@ Here are some explanation of parameters:
 * STEP 3:[Optional] Override optional functions. In principle, all functions in BaseLoader can be override, but we **do not** recommend you to override *\_\_len\_\_, \_\_get\_item\_\_,save,load*.
 * STEP 4:Set or add configuration parameters.  To set paramteters, create new yaml files in configs/ .  Adding parameters requires modifying config.py, adding new parameters' definition and initial values.
 
-# :robot: Adding a New Neural Algorithms
+## :robot: Adding a New rPPG Extractor
 
-* STEP 1: Define a model in a new python file in `neural_methods/model`, e.g. NewModel.py.
+* STEP 1: Define a model in a new python file in `neural_extractor/model`, e.g. NewModel.py.
 
-* STEP 2: Implement the corresponding training/testing routines in a file `neural_methods/trainer`, e.g. NewModelTrainer.py. Ensure to implement the following functions:
+* STEP 2: Implement the corresponding training/testing routines just like **rPPG-Toolbox repository**, e.g. NewModelTrainer.py. Ensure to implement the following functions:
 
   ```python
   def __init__(self, config, data_loader):
@@ -447,48 +443,16 @@ Here are some explanation of parameters:
   def save_model(index)
   ```
 
-* STEP 3: Add logic to `main.py` to use the models in the following `train_and_test` and `test` functions. 
+* STEP 3: Add logic to `main.py` to use the models in the following `train_and_test` and `test` functions like **rPPG-Toolbox repository**. 
 
 * STEP 4: Create new yaml files in configs/ corresponding to the new algorithm.
 
-# :chart_with_upwards_trend: Adding a New Unsupervised Algorithms
+* STEP 5: Pre-train the rPPG extractor and apply it as an extractor e.g. `neural_extractors/model` and `pretrained_extractors`
 
-* STEP 1: Define a algorithm in a new python file in `unsupervised_methods/methods`, e.g. NewMethod.py.
+## :chart_with_upwards_trend: Adding a New Unsupervised Algorithms
+
+* STEP 1: Define a algorithm in a new python file in `unsupervised_extractors/methods`, e.g. NewMethod.py.
 
 * STEP 2: Add logic to `main.py` to use the models in the following `unsupervised_method_inference` function. 
 
 * STEP 4: Create new yaml files in configs/ corresponding to the new algorithm.
-
-
-
-# :page_with_curl: Using Custom Data Splits and Custom File Lists
-
-Best practice for rPPG model evaluation involves training and validating a model on one dataset and then evaluating (testing) the performance on additional datasets (Eg. training on PURE and testing on UBFC). Data splits used for training, validation, and testing are saved as .csv filelists with the default directory path set as `CACHED_PATH/DataFileLists` (this are generally auto generated). In cases where users would like to define their own data splits (Eg. for intra-dataset cross validation), the following steps can be used to achieve this.  
-
-* STEP 1: Collect all file paths for the data splits's input files (An example file path would be of format `CACHED_PATH/PREPROCESSED_DATASET/*input*.npy`, eg. `405_input9.npy`). Ensure the corresponding `*label*.npy` files exists in the same directory as the input files.
-
-* STEP 2: Add all file paths to a .csv with column name `input_files`. We suggest creating a pandas dataframe and then saving this out to the csv. This .csv file is the file list for your custom data split. The file can be named anything as long as it has an .csv extension.
-
-* STEP 3: In the desired experiment config file, enter the file path of the .csv file list using keyword `FILE_LIST_PATH` in the `DATA` field of the desired train/valid/test split. The dataloader will load input and label files specified in this file path. 
-
-# :scroll: Citation
-If you find our [paper](https://arxiv.org/abs/2210.00716) or this toolbox useful for your research, please cite our work.
-
-```
-@article{liu2022rppg,
-  title={rPPG-Toolbox: Deep Remote PPG Toolbox},
-  author={Liu, Xin and Narayanswamy, Girish and Paruchuri, Akshay and Zhang, Xiaoyu and Tang, Jiankai and Zhang, Yuzhe and Wang, Yuntao and Sengupta, Soumyadip and Patel, Shwetak and McDuff, Daniel},
-  journal={arXiv preprint arXiv:2210.00716},
-  year={2022}
-}
-```
-
-# License
-<a href="https://www.licenses.ai/source-code-license">
-  <img src="https://images.squarespace-cdn.com/content/v1/5c2a6d5c45776e85d1482a7e/1546750722018-T7QVBTM15DQMBJF6A62M/RAIL+Final.png" alt="License: Responsible AI" width="30%">
-</a>
-
-# Acknowledgement 
-
-This research project is supported by a Google PhD Fellowship for Xin Liu and a research grant from Cisco for the University of Washington as well as a career start-up funding grant from the Department of Computer Science at UNC Chapel Hill. This research is also supported by Tsinghua University Initiative Scientific Research Program, Beijing Natural Science Foundation,  and the Natural Science Foundation of China (NSFC). We also would like to acknowledge all the contributors from the open-source community. 
-
