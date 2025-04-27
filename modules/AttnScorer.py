@@ -74,7 +74,7 @@ class AttnScorer(nn.Module):
             attn  = entmax.entmax_bisect(raw_scaled, alpha=alpha, dim=1)
         elif epoch < 35:                                                    # Phase 1:    Entmax15 sparse
             attn  = entmax.entmax15(raw_scaled, dim=1)
-        else:                                                               # Phase 2:    scorer frozen
+        else:                                                               # Phase 2:    scorer fine-tune
             attn  = None                                                    # use raw_scores only
         
         # 4) DEBUG
