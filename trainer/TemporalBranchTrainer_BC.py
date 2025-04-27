@@ -226,8 +226,9 @@ from modules.ChunkAuxClassifier import ChunkAuxClassifier
 # from modules.TopKPooling import TopKSoftPooling
 # from modules.GatedAttentionPooling import GatedAttentionPooling
 
-from tools.utils import SupConLossTopK# , AlignCosineLoss
+from tools.utils import SupConLossTopK
 from tools.utils import reconstruct_sessions, run_tsne_and_plot, straight_through_topk
+
 
 class TemporalBranchTrainer_BC(BaseTrainer):
     """
@@ -288,7 +289,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
         
         wandb.init(
             project="TemporalReMOTION",
-            name=f"Exp_{self.config.TRAIN.MODEL_FILE_NAME}_sparsity_again",
+            name=f"Exp_{self.config.TRAIN.MODEL_FILE_NAME}_test",
             # config=cfg_dict,
             dir="./wandb_logs"
         )
@@ -370,7 +371,10 @@ class TemporalBranchTrainer_BC(BaseTrainer):
         """SupConLossTopK: supervised contrastive loss using top-K attended chunks per session"""
         self.contrastive_loss_fn = SupConLossTopK(temperature=0.1)
         
-        """CrossEntropyLoss: standard cross-entropy loss for classification"""
+        """CrossEntropyLoss: standard cross-entropy loss for chunk-level classification(phase1)"""
+        self.aux_criterion = nn.CrossEntropyLoss(reduction='none')
+        
+        """CrossEntropyLoss: standard cross-entropy loss for session-level classification(phase2)"""
         self.criterion = nn.CrossEntropyLoss() # <================================ HOW ABOUT FOCAL LOSS???
         
         """
@@ -458,7 +462,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
             else:
                 self.contrastive_weight = 0.55 - 0.02 * (epoch-10)  # 0.55→0.35
             self.contrastive_weight = max(0.3, self.contrastive_weight)
-            self.lambda_ent      = 0.05 # for sparsity loss
+            self.lambda_ent      = 0.05
             self.chunk_ce_weight = 0.0
             self.ce_weight       = 0.0
             
@@ -477,12 +481,12 @@ class TemporalBranchTrainer_BC(BaseTrainer):
             if epoch <= 24:
                 self.chunk_ce_weight = 0.25
             else:
-                self.chunk_ce_weight = 0.35 + 0.025 * (epoch-25)      # 0.35→0.60
-            self.contrastive_weight = 0.0
+                self.chunk_ce_weight = 0.35 + 0.025 * (epoch-25)        # 0.35→0.60
+            self.contrastive_weight = 0.05                              # Weak SupCon
             self.lambda_ent         = 0.0
             self.chunk_ce_weight    = min(0.60, self.chunk_ce_weight)
             self.ce_weight          = 0.0
-            self.temperature        = 1.0         # fixed
+            self.temperature        = 1.0                               # fixed
         
         # ───────────────────── Phase-2 ─────────────────────
         else:                          
@@ -495,7 +499,9 @@ class TemporalBranchTrainer_BC(BaseTrainer):
             
         # ─────── Gradient gate ───────
         for p in self.attn_scorer.parameters():
-            p.requires_grad = (phase <= 1)
+            p.requires_grad = True
+        for p in self.temporal_branch.parameters():
+            p.requires_grad = True
         for p in self.chunk_projection.parameters():
             p.requires_grad = (phase <= 1)
         for p in self.chunk_aux_classifier.parameters():
@@ -509,31 +515,59 @@ class TemporalBranchTrainer_BC(BaseTrainer):
         self.top_k_ratio = max(0.2, 0.5 - 0.3 * (epoch / PHASE2_END))
 
         # Reconfigure optimizer/scheduler per phase
-        self.configure_optimizer_scheduler(lr, wd, t_max)
+        self.configure_optimizer_scheduler(lr, wd, t_max, phase)
         
         # SupConLoss sampling scheduling (e.g., threshold, top-k mask, etc.)
         self.contrastive_loss_fn.schedule_params(epoch, self.max_epoch)
         
         return phase
 
-    def configure_optimizer_scheduler(self, lr, weight_decay, t_max):
+    def configure_optimizer_scheduler(self, lr, weight_decay, t_max, phase):
         """
-        Configures optimizer and scheduler for the current phase.
+        Phase-wise optimizer & scheduler setup.
         Automatically resets learning rate and weight decay per phase.
-        """
-        param_groups = {'decay': [], 'no_decay': []}
-        for module in [
-            self.temporal_branch, self.attn_scorer, self.pooling,
-            self.chunk_projection, self.chunk_aux_classifier, self.classifier
-        ]:
-            for name, param in module.named_parameters():
-                if not param.requires_grad:
-                    continue
-                group = 'no_decay' if ("bias" in name or "LayerNorm" in name) else 'decay'
-                param_groups[group].append({"params": param, "weight_decay": 0.0 if group == 'no_decay' else weight_decay})
 
-        self.optimizer = optim.AdamW(param_groups['decay'] + param_groups['no_decay'], lr=lr)
-        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=t_max, eta_min=1e-6)
+        * phase 0 : AttnScorer LR = 1.00 × lr
+        * phase 1 : AttnScorer LR = 0.5 × lr    (preventing over variance during ST-Top-K)
+        * phase 2 : AttnScorer LR = 0.10 × lr   (optional – fine-tuning)
+        """
+        # ------------------------------------------------------------------
+        lr_scale_as = 1.0 if phase == 0 else (0.5 if phase == 1 else 0.10)
+        lr_raw      = lr                     # default lr per phase
+        lr_as       = lr * lr_scale_as       # lr for AttnScorer
+        # ------------------------------------------------------------------
+
+        pg_decay, pg_nodecay = [], []
+
+        def add_param(param, name, lr_this):
+            is_nd = ("bias" in name or "LayerNorm" in name)
+            group  = pg_nodecay if is_nd else pg_decay
+            group.append(
+                {"params": param,
+                "lr": lr_this,
+                "weight_decay": 0.0 if is_nd else weight_decay}
+            )
+
+        # --------- params setup ---------
+        modules = [
+            (self.temporal_branch,     lr_raw),
+            (self.attn_scorer,         lr_as),
+            (self.pooling,             lr_raw),
+            (self.chunk_projection,    lr_raw),
+            (self.chunk_aux_classifier,lr_raw),
+            (self.classifier,          lr_raw),
+        ]
+
+        for module, lr_mod in modules:
+            for n, p in module.named_parameters():
+                if p.requires_grad:
+                    add_param(p, n, lr_mod)
+
+        # --------- Optimizer / Scheduler ---------
+        self.optimizer = optim.AdamW(pg_decay + pg_nodecay)
+        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=t_max, eta_min=1e-6
+        )
         # self.scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(self.optimizer, T_0=10, T_mult=2, eta_min=1e-6)
 
     
@@ -604,7 +638,10 @@ class TemporalBranchTrainer_BC(BaseTrainer):
             print(f"[DEBUG] Session {sid}  #chunks={T}, σ_running={self.attn_scorer.running_score_std.item():.3f}")
             
             # 3) build α  – soft in Phase-0, ST-Top-K in Phase-1
-            if phase == 1: # Phase-1 ST-Top-K
+            if phase == 0:      # Phase-0 softmax
+                alpha = attn_soft 
+                entropy_attn_soft = -(alpha * alpha.clamp_min(1e-8).log()).sum(dim=1).mean()
+            elif phase == 1:    # Phase-1 ST-Top-K
                 if len(raw_scaled.squeeze(0).squeeze(-1)) < 1:
                     print("Empty attention scores – skip this session")
                     continue
@@ -613,26 +650,29 @@ class TemporalBranchTrainer_BC(BaseTrainer):
                 mask_bool  = alpha_mask.squeeze(0).bool()           # (T,)
                 alpha = alpha_mask.unsqueeze(-1)                    # (1,T,1)
                 print(f"[DEBUG] Top-K selected = {mask_bool.sum().item()} / {T}")
-            else:          # Phase-0 softmax or Phase-2 raw scores
-                alpha = attn_soft
+                entropy_attn_soft = -(attn_soft * attn_soft.clamp_min(1e-8).log()).sum(dim=1).mean()
+            else:               # Phase-2 raw scores
+                alpha = torch.ones_like(raw_scaled)   # (1,T,1)
+                entropy_attn_soft = 0
 
             # 4) apply α before projection  (keeps grad path)
             gated_emb   = chunk_emb * alpha                           # (1,T,D)
             proj_embeds = self.chunk_projection(gated_emb)            # (1,T,128)
 
             # 5-A) SupCon collection
-            if phase < 1:
+            if phase <= 1:
                 proj_for_supcon.append(proj_embeds.squeeze(0))
                 labels_for_supcon.append(torch.full((T,), label,
                                     dtype=torch.long, device=self.device))
 
             # 5-B) Top-K chunk CE  (Phase-1)
             if phase == 1:
-                topk_emb  = chunk_emb.squeeze(0)[mask_bool]           # (K,D)
-                topk_logits = self.chunk_aux_classifier(topk_emb)
-                topk_labels = torch.full((len(topk_logits),), label,
-                                        dtype=torch.long, device=self.device)
-                chunk_ce_losses.append(self.criterion(topk_logits, topk_labels))
+                logits_all = self.chunk_aux_classifier(chunk_emb.squeeze(0))  # (T,C)
+                lbl_all    = torch.full((T,), label, device=self.device)      # (T)
+                ce_all     = self.aux_criterion(logits_all, lbl_all)              # scalar
+                #   (B,T,1)   (B,T)  -> broadcast : using alpha_mask
+                weighted_ce = (alpha_mask.squeeze(0) * ce_all).sum() / alpha_mask.sum()
+                chunk_ce_losses.append(weighted_ce)
 
             # 6) session-level pooling
             pooled, attn_gated, ent_gated = self.pooling(
@@ -647,16 +687,15 @@ class TemporalBranchTrainer_BC(BaseTrainer):
             target_labels.append(label)
 
             # 7) entropy bookkeeping
-            entropy_attn = -(alpha * alpha.clamp_min(1e-8).log()).sum(dim=1).mean()
-            entropy_attn_list.append(entropy_attn)
+            entropy_attn_list.append(entropy_attn_soft)
             entropy_gated_list.append(ent_gated)
-            entropy_list.append(entropy_attn if phase < 2 else ent_gated)
+            entropy_list.append(entropy_attn_soft if phase < 2 else ent_gated)
 
             # 8) OPTIONAL chunk-level debug
             if phase < 2:
                 attn_np = attn_soft.detach().cpu().squeeze().numpy()
                 print(f"[DEBUG][Attn Weights] {attn_np.tolist()}")
-                print(f"[DEBUG][Attn Sparsity] mean={attn_np.mean():.4f}, std={attn_np.std():.4f}, entropy={entropy_attn.item():.4f}")
+                print(f"[DEBUG][Attn Sparsity] mean={attn_np.mean():.4f}, std={attn_np.std():.4f}, entropy={entropy_attn_soft.item():.4f}")
             else:
                 gated_np = attn_gated.detach().cpu().squeeze().numpy()
                 print(f"[DEBUG][Gated Attn Weights] {gated_np.tolist()}")
@@ -664,7 +703,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
 
         # ───── phase-specific losses ─────────────────────────
         # SupCon (Phase-0)
-        if phase < 1 and proj_for_supcon:
+        if phase < 2 and proj_for_supcon:
             proj_concat  = torch.cat(proj_for_supcon, 0)
             label_concat = torch.cat(labels_for_supcon, 0)
             if label_concat.unique().numel() >= 2:
@@ -701,7 +740,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
                 return None
             loss_total = contrastive_term_scaled + self.lambda_ent * sparsity_loss
         elif phase == 1:
-            loss_total = chunk_ce_loss_scaled
+            loss_total = chunk_ce_loss_scaled + contrastive_term_scaled # for attnscorer grad
         else:                              # phase 2
             loss_total = ce_loss_scaled
         # ----------------------------------------------------
@@ -722,10 +761,15 @@ class TemporalBranchTrainer_BC(BaseTrainer):
         print(f"   ▸ Chunk CE   : {chunk_ce_raw.item():.4f} × "
             f"{self.chunk_ce_weight:.2f} = "
             f"{chunk_ce_loss_scaled.item():.4f}")
-        entropy_attn_mean  = torch.stack(entropy_attn_list).mean()
         entropy_gated_mean = torch.stack(entropy_gated_list).mean()
-        print(f"   ▸ Entropy    : Scorer = {entropy_attn_mean:.4f}, "
-            f"Gated = {entropy_gated_mean:.4f}")
+        if phase < 2:
+            entropy_attn_mean = torch.stack(entropy_attn_list).mean()
+            print(f"   ▸ Entropy    : Scorer = {entropy_attn_mean:.4f}, "
+                f"Gated = {entropy_gated_mean:.4f}")
+        else:
+            entropy_attn_mean = torch.tensor(0.0, device=self.device)
+            print(f"   ▸ Entropy    : Scorer = None(Phase 2), "
+                f"Gated = {entropy_gated_mean:.4f}")
         print(f"   ▸ Sparsity   : {sparsity_loss.item():.4f}")
         print(f"   ▶ Total Loss : {loss_total.item():.4f}")
         print("─" * 60)
@@ -793,7 +837,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
             entropy_gated_all = []
 
             # === Temporary call for logging current scheduling phase only ===
-            phase = self.update_training_state(epoch)
+            phase = self.update_training_state(epoch+40)
 
             # === Epoch Settings Print ===
             print("\n" + "=" * 80)
@@ -829,7 +873,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
             self.session_labels_for_tsne.clear()
 
             for idx, batch in enumerate(tbar):
-                out = self.forward_batch(batch, epoch, phase)
+                out = self.forward_batch(batch, epoch+40, phase)
                 if out is None:
                     print(f"[SKIP] Batch {idx} skipped due to lack of contrastive labels")
                     continue

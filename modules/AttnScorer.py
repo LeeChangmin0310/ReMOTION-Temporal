@@ -67,23 +67,19 @@ class AttnScorer(nn.Module):
         raw_scaled = raw_scores * gamma                       # scale
         
         # --- choose attention kernel ----------------------
-        if epoch < 10:                                               # Phase 0-a:  Softmax explore
+        if epoch < 10:                                                      # Phase 0-a:  Softmax explore
             attn = torch.softmax(raw_scaled / temperature, dim=1)
-        
-        elif epoch < 20:                                            # Phase 0-b:  α-Entmax warm-up
-            alpha = 2.0 - 0.1 * max(0, epoch - 4)                   # α 1.9→1.6 linearly
+        elif epoch < 20:                                                    # Phase 0-b:  α-Entmax warm-up
+            alpha = 2.0 - 0.1 * max(0, epoch - 4)                           # α 1.9→1.6 linearly
             attn  = entmax.entmax_bisect(raw_scaled, alpha=alpha, dim=1)
-        
-        elif epoch < 35:                                            # Phase 1:    Entmax15 sparse
+        elif epoch < 35:                                                    # Phase 1:    Entmax15 sparse
             attn  = entmax.entmax15(raw_scaled, dim=1)
-        
-        else:                                                       # Phase 2:    scorer frozen
-            attn  = None                                            # use raw_scores only
+        else:                                                               # Phase 2:    scorer frozen
+            attn  = None                                                    # use raw_scores only
         
         # 4) DEBUG
         if self.training and (torch.rand(1).item() < 0.05):   # 5 % 확률
             print(f"[AttnScorer] epoch={epoch:02d} | σ={sigma:.3f} "
                   f"→ γ={gamma:.2f} | kernel={('soft','α','15','raw')[min(3,epoch//15)]}")
-
         
         return attn, raw_scaled

@@ -155,7 +155,8 @@ def straight_through_topk(raw_scores: torch.Tensor, k: int, soft_branch: str = "
     hard = torch.zeros_like(probs).scatter_(1, top_idx, 1.0)
 
     # ---- straight-through --------------------------------------------------
-    return (hard - probs).detach() + probs         # (B,T)
+    # forward : hard , backward : probs
+    return hard + (probs - probs.detach())      # ≡ probs.grad , hard.forward  <- (B,T)
 
 
 

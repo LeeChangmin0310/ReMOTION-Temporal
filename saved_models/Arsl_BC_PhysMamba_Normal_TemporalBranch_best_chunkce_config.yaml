@@ -57,8 +57,8 @@ MODEL:
     FRAME_NUM: 160
 NUM_OF_GPU_TRAIN: 1
 RESULTS:
-  accuracy: 0.5283018867924528
-  best_epoch: 28
+  accuracy: 0.49056603773584906
+  best_epoch: 0
   confusion_matrix: !!python/object/apply:numpy.core.multiarray._reconstruct
     args:
     - !!python/name:numpy.ndarray ''
@@ -87,11 +87,11 @@ RESULTS:
       - 0
     - false
     - !!binary |
-      HAAAAAAAAAAAAAAAAAAAABkAAAAAAAAAAAAAAAAAAAA=
-  f1_score: 0.0
+      AQAAAAAAAAAbAAAAAAAAAAAAAAAAAAAAGQAAAAAAAAA=
+  f1_score: 0.6493506493506493
   tag: best_chunkce
-  train_loss: 0.2073531191585199
-  valid_loss: 1.030457948316943
+  train_loss: 0.17830314304468767
+  valid_loss: 0.7201917610078488
 ReMOTION_MODE: train_and_test
 TEST:
   BATCH_SIZE: 1
@@ -182,7 +182,7 @@ TEST:
   OUTPUT_SAVE_DIR: /home/changmin/log/MAHNOB-HCI_SizeW128_SizeH128_ClipLength128_DataTypeDiffNormalized_DataAugNone_LabelTypeDiffNormalized_Crop_faceTrue_BackendHC_Large_boxTrue_Large_size1.5_Dyamic_DetFalse_det_len30_Median_face_boxFalse/saved_test_outputs
   USE_LAST_EPOCH: false
 TRAIN:
-  BATCH_SIZE: 4
+  BATCH_SIZE: 8
   DATA:
     BEGIN: 0.0
     CACHED_PATH: /home/changmin/data/MAHNOB_HCI_Emotion_Preprocessed/MAHNOB-HCI_SizeW128_SizeH128_ClipLength128_DataTypeDiffNormalized_DataAugNone_LabelTypeDiffNormalized_Crop_faceTrue_BackendHC_Large_boxTrue_Large_size1.5_Dyamic_DetFalse_det_len30_Median_face_boxFalse

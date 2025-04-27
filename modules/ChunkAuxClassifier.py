@@ -28,7 +28,7 @@ class ChunkAuxClassifier(nn.Module):
         super().__init__()
 
         # Lightweight classifier: Linear layer + activation + output layer
-        self.classifier = nn.Sequential(
+        self.aux_classifier = nn.Sequential(
             nn.LayerNorm(input_dim),        # Normalization for stability
             nn.Linear(input_dim, input_dim // 2),
             nn.GELU(),                      # Non-linear activation
@@ -49,5 +49,5 @@ class ChunkAuxClassifier(nn.Module):
         if x.dim() == 3:
             B, T, D = x.shape
             x = x.view(B * T, D)  # Flatten chunks for classification
-        return self.classifier(x)
+        return self.aux_classifier(x)
 
