@@ -1238,7 +1238,6 @@ class TemporalBranchTrainer_BC(BaseTrainer):
             "train_total": self.train_losses,
             "val_total": self.val_losses,
             "ce": self.loss_ce_per_epoch,
-            "contrastive": self.loss_contrastive_per_epoch,
             "sparsity": self.loss_sparsity_per_epoch,
             "cos": self.loss_cos_per_epoch,
             "chunk_ce": self.loss_chunk_ce_per_epoch,
