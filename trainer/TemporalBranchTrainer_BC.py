@@ -289,7 +289,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
         
         wandb.init(
             project="TemporalReMOTION",
-            name=f"Exp_{self.config.TRAIN.MODEL_FILE_NAME}_FINALPIPE",
+            name=f"Exp_Arsl_FINALPIPE_CEsoftmax",
             # config=cfg_dict,
             dir="./wandb_logs"
         )
@@ -454,7 +454,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
         
         # ───────────────────── Phase-0 ─────────────────────
         if epoch <= PHASE0_END:          # Phase-0   (0–19)
-            phase, lr, wd, t_max = 0, 3e-4, 1e-4, 20
+            phase, lr, wd, t_max = 0, 3e-4, 1e-4, 20 # (= phase length × 1.0)
             
             # ① SupCon λ : 0-4 (1→0.6) , 5-19 (0.6→0.3)
             if  epoch < 10:
@@ -462,7 +462,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
             else:
                 self.contrastive_weight = 0.55 - 0.02 * (epoch-10)  # 0.55→0.35
             self.contrastive_weight = max(0.3, self.contrastive_weight)
-            self.lambda_ent      = 0.05
+            self.lambda_ent      = 0.1
             self.chunk_ce_weight = 0.0
             self.ce_weight       = 0.0
             
@@ -471,18 +471,18 @@ class TemporalBranchTrainer_BC(BaseTrainer):
                 self.temperature = 1.0
             else:
                 tau = 2.5 - self.avg_entropy_attn
-                self.temperature = max(0.5, min(1.2, tau))
+                self.temperature = max(0.7, min(1.2, tau))
         
         # ───────────────────── Phase-1 ─────────────────────
         elif epoch <= PHASE1_END:        
-            phase, lr, wd, t_max = 1, 2e-4, 5e-5, 15
+            phase, lr, wd, t_max = 1, 2e-4, 5e-5, 20 # (= 15 × 1.3 ≈ 20)
             
             # ② Chunk-CE λ : 20-24 = 0.3, 25-34 = 0.5→0.7
             if epoch <= 24:
-                self.chunk_ce_weight = 0.25
+                self.chunk_ce_weight = 0.35
             else:
                 self.chunk_ce_weight = 0.35 + 0.025 * (epoch-25)        # 0.35→0.60
-            self.contrastive_weight = 0.05                              # Weak SupCon
+            self.contrastive_weight = 0.0                               # Weak SupCon
             self.lambda_ent         = 0.0
             self.chunk_ce_weight    = min(0.60, self.chunk_ce_weight)
             self.ce_weight          = 0.0
@@ -490,7 +490,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
         
         # ───────────────────── Phase-2 ─────────────────────
         else:                          
-            phase, lr, wd, t_max = 2, 1e-4, 5e-5, 10
+            phase, lr, wd, t_max = 2, 1e-4, 5e-5, 15 # (= 15 × 1.0)
             self.lambda_ent         = 0.0
             self.contrastive_weight = 0.0
             self.chunk_ce_weight    = 0.0
@@ -503,7 +503,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
         for p in self.temporal_branch.parameters():
             p.requires_grad = True
         for p in self.chunk_projection.parameters():
-            p.requires_grad = (phase <= 1)
+            p.requires_grad = (phase < 1)
         for p in self.chunk_aux_classifier.parameters():
             p.requires_grad = (phase == 1)
         for p in self.pooling.parameters():
@@ -512,7 +512,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
             p.requires_grad = (phase == 2)
 
         # Top-K Ratio
-        self.top_k_ratio = max(0.2, 0.5 - 0.3 * (epoch / PHASE2_END))
+        self.top_k_ratio = max(0.3, 0.6 - 0.3 * (epoch / PHASE2_END))
 
         # Reconfigure optimizer/scheduler per phase
         self.configure_optimizer_scheduler(lr, wd, t_max, phase)
@@ -528,11 +528,11 @@ class TemporalBranchTrainer_BC(BaseTrainer):
         Automatically resets learning rate and weight decay per phase.
 
         * phase 0 : AttnScorer LR = 1.00 × lr
-        * phase 1 : AttnScorer LR = 0.5 × lr    (preventing over variance during ST-Top-K)
-        * phase 2 : AttnScorer LR = 0.10 × lr   (optional – fine-tuning)
+        * phase 1 : AttnScorer LR = 1.00 × lr   
+        * phase 2 : AttnScorer LR = 0.50 × lr   (fine-tuning)
         """
         # ------------------------------------------------------------------
-        lr_scale_as = 1.0 if phase == 0 else (0.5 if phase == 1 else 0.10)
+        lr_scale_as = 1.0 if phase < 2 else 0.5
         lr_raw      = lr                     # default lr per phase
         lr_as       = lr * lr_scale_as       # lr for AttnScorer
         # ------------------------------------------------------------------
@@ -660,7 +660,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
             proj_embeds = self.chunk_projection(gated_emb)            # (1,T,128)
 
             # 5-A) SupCon collection
-            if phase <= 1:
+            if phase < 1:
                 proj_for_supcon.append(proj_embeds.squeeze(0))
                 labels_for_supcon.append(torch.full((T,), label,
                                     dtype=torch.long, device=self.device))
@@ -669,9 +669,9 @@ class TemporalBranchTrainer_BC(BaseTrainer):
             if phase == 1:
                 logits_all = self.chunk_aux_classifier(chunk_emb.squeeze(0))  # (T,C)
                 lbl_all    = torch.full((T,), label, device=self.device)      # (T)
-                ce_all     = self.aux_criterion(logits_all, lbl_all)              # scalar
-                #   (B,T,1)   (B,T)  -> broadcast : using alpha_mask
-                weighted_ce = (alpha_mask.squeeze(0) * ce_all).sum() / alpha_mask.sum()
+                ce_per_chunk     = self.aux_criterion(logits_all, lbl_all)              # scalar
+                weighted_ce  = (alpha_mask.squeeze(0) * ce_per_chunk).sum() / (
+                                alpha_mask.squeeze(0).sum() + 1e-8)  # ← eps
                 chunk_ce_losses.append(weighted_ce)
 
             # 6) session-level pooling
@@ -703,7 +703,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
 
         # ───── phase-specific losses ─────────────────────────
         # SupCon (Phase-0)
-        if phase < 2 and proj_for_supcon:
+        if phase < 1 and proj_for_supcon:
             proj_concat  = torch.cat(proj_for_supcon, 0)
             label_concat = torch.cat(labels_for_supcon, 0)
             if label_concat.unique().numel() >= 2:
