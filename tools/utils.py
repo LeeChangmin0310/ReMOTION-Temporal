@@ -251,30 +251,36 @@ class SupConLossTopK(nn.Module):
 
         return loss.mean()
 
-    def schedule_params(self, epoch, max_epoch):
+    def schedule_params(self, epoch: int, max_epoch: int):
         """
-        Dynamically update contrastive sampling strategy based on training phase.
-        # Scheduling parameters for balance and curriculum
+        Curriculum-based positive / negative sampling schedule for SupConLossTopK.
         """
-        # Phase 1: Warm-up (0 ~ 19)
-        if epoch < 20:
-            self.max_pos = 6
-            self.max_neg = 24
-            self.pos_neg_ratio = 1.0
+        # ---------- Phase-1  (0-19) : warm-up ----------
+        if epoch < 20:                      # 0-19
+            self.max_pos        = 6
+            self.max_neg        = 24
+            self.pos_neg_ratio  = 1.00      # full contrastive
 
-        # Phase 2: Ramp-up (20 ~ 34)
-        elif epoch < 35:
-            self.max_pos = 8
-            self.max_neg = 40
-            self.pos_neg_ratio = max(0.5, 1.0 - (epoch - 20) * 0.03)
+        # ---------- Phase-2  (20-34) : ramp-up ----------
+        elif epoch < 35:                    # 20-34
+            if   epoch < 25:                # 20-24
+                self.max_pos       = 6
+                self.max_neg       = 30
+                self.pos_neg_ratio = 0.80
+            elif epoch < 30:                # 25-29
+                self.max_pos       = 8
+                self.max_neg       = 40
+                self.pos_neg_ratio = 0.65 - 0.025 * (epoch - 25)  # 0.65→0.55
+            else:                           # 30-34
+                self.max_pos       = 8
+                self.max_neg       = 48
+                self.pos_neg_ratio = 0.50 - 0.02  * (epoch - 30)  # 0.50→0.40
 
-        # Phase 3: Fine-tuning (35+)
+        # ---------- Phase-3  (≥35) : SupCon off ----------
         else:
-            self.max_pos = 6
-            self.max_neg = 30
-            self.pos_neg_ratio = 0.3
-
-        # print(f"[Schedule][SupCon] max_pos={self.max_pos}, max_neg={self.max_neg}, ratio={self.pos_neg_ratio:.2f}")
+            self.max_pos        = 0
+            self.max_neg        = 0
+            self.pos_neg_ratio  = 0.0       # disable SupCon
 
 # --- Utility function for Consine Similarity loss between two session-level embeddings ---
 class AlignCosineLoss(nn.Module):
