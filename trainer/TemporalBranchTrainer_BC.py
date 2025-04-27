@@ -289,7 +289,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
         
         wandb.init(
             project="TemporalReMOTION",
-            name=f"Exp_{self.config.TRAIN.MODEL_FILE_NAME}_test",
+            name=f"Exp_{self.config.TRAIN.MODEL_FILE_NAME}_FINALPIPE",
             # config=cfg_dict,
             dir="./wandb_logs"
         )
@@ -837,7 +837,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
             entropy_gated_all = []
 
             # === Temporary call for logging current scheduling phase only ===
-            phase = self.update_training_state(epoch+40)
+            phase = self.update_training_state(epoch)
 
             # === Epoch Settings Print ===
             print("\n" + "=" * 80)
@@ -873,7 +873,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
             self.session_labels_for_tsne.clear()
 
             for idx, batch in enumerate(tbar):
-                out = self.forward_batch(batch, epoch+40, phase)
+                out = self.forward_batch(batch, epoch, phase)
                 if out is None:
                     print(f"[SKIP] Batch {idx} skipped due to lack of contrastive labels")
                     continue

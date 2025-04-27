@@ -89,7 +89,7 @@ RESULTS:
     - !!binary |
       AwAAAAAAAAAZAAAAAAAAAAMAAAAAAAAAFgAAAAAAAAA=
   f1_score: 0.6111111111111112
-  tag: best_ce_loss
+  tag: best_metric_phase2
   train_loss: 0.8670608474398559
   valid_loss: 0.6941308660327263
 ReMOTION_MODE: train_and_test
