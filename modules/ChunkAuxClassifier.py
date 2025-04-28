@@ -23,18 +23,21 @@ class ChunkAuxClassifier(nn.Module):
     Output:
         - logits: Tensor of shape (B, C) or (B * T, C), for classification
     """
-
-    def __init__(self, input_dim: int, num_classes: int, dropout_rate: float = 0.2):
+    def __init__(self, input_dim, num_classes, hidden_dim=64, dropout=0.3):
         super().__init__()
-
-        # Lightweight classifier: Linear layer + activation + output layer
         self.aux_classifier = nn.Sequential(
-            nn.LayerNorm(input_dim),        # Normalization for stability
-            nn.Linear(input_dim, input_dim // 2),
-            nn.GELU(),                      # Non-linear activation
-            nn.Dropout(dropout_rate),       # Regularization
-            nn.Linear(input_dim // 2, num_classes)  # Final output layer
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, num_classes),
         )
+        # He init
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
     def forward(self, x):
         """
@@ -49,5 +52,5 @@ class ChunkAuxClassifier(nn.Module):
         if x.dim() == 3:
             B, T, D = x.shape
             x = x.view(B * T, D)  # Flatten chunks for classification
-        return self.aux_classifier(x)
 
+        return self.aux_classifier(x)  # (B, C)

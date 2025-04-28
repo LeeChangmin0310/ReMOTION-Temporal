@@ -52,11 +52,13 @@ class GatedPooling(nn.Module):
             entropy (optional): scalar entropy term
         """
         # attn_weights = entmax.entmax15(attn_scores, dim=1)  # (B, T, 1)
-        attn_weights = F.softmax(attn_scores, dim=1)  # (B, T, 1)
+        # attn_weights = F.softmax(attn_scores, dim=1)  # (B, T, 1)
+        alpha_g = 1.2
+        attn_weights = entmax.entmax_bisect(attn_scores, alpha=alpha_g, dim=1)  # (B, T, 1)
 
-        gate = self.gate(x)          # (B, T, D)
-        gated_x = x * gate           # (B, T, D)
-        pooled = torch.sum(attn_weights * gated_x, dim=1)  # (B, D)
+        gate = self.gate(x)                                                     # (B, T, D)
+        gated_x = x * gate                                                      # (B, T, D)
+        pooled = torch.sum(attn_weights * gated_x, dim=1)                       # (B, D)
 
         entropy = -torch.sum(attn_weights * torch.log(attn_weights + 1e-8), dim=1).mean()
 

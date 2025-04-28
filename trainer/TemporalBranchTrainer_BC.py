@@ -288,7 +288,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
         
         wandb.init(
             project="TemporalReMOTION",
-            name=f"Exp_Arsl_FINALPIPE",
+            name=f"Exp_Arsl_FINAL_NoRes",
             # config=cfg_dict,
             dir="./wandb_logs"
         )
@@ -443,10 +443,10 @@ class TemporalBranchTrainer_BC(BaseTrainer):
         """
         
         # ───────────────────── Phase-0 ─────────────────────
-        if epoch < PHASE_BOUND[0]:                                  # Phase-0   (0–14)
-            phase, lr, wd, t_max = 0, 3e-4, 1e-4, 15                # (= phase length × 1.0)
+        if epoch < PHASE_BOUND[0]:                                                      # Phase-0   (0–14)
+            phase, lr, wd, t_max = 0, 3e-4, 1e-4, 15                                    # (= phase length × 1.0)
             
-            self.contrastive_weight = max(0.4, 1.0 - 0.04 * epoch)  # SupCon λ (diversity to sparsity) 
+            self.contrastive_weight = max(0.4, 1.0 - 0.04 * epoch)                      # SupCon λ (diversity to sparsity) 
             self.lambda_ent         = 0.1
             self.chunk_ce_weight    = 0.0
             self.top_k_ratio        = 0.0
@@ -460,24 +460,24 @@ class TemporalBranchTrainer_BC(BaseTrainer):
                 self.temperature = max(0.7, min(1.2, tau))
         
         # ───────────────────── Phase-1 ─────────────────────
-        elif epoch < PHASE_BOUND[1]:        
-            phase, lr, wd, t_max = 1, 2e-4, 5e-5, 10                    # (= 15 × 1.3 ≈ 20)
+        elif PHASE_BOUND[0] <= epoch < PHASE_BOUND[1]:        
+            phase, lr, wd, t_max    = 1, 2e-4, 5e-5, 10                                 # (= 15 × 1.3 ≈ 20)
             
-            self.contrastive_weight = 0.0                               # Weak SupCon
+            self.contrastive_weight = 0.0                                               # Weak SupCon
             self.lambda_ent         = 0.0
-            self.chunk_ce_weight    = 0.35 + 0.025 * (epoch - 15)       # λ_chunk : 0.35 → 0.60 (10 epoch)
-            self.top_k_ratio        = 0.45 - 0.02 * (epoch - 15)        # Top-k ratio: 0.45 → 0.25 (linearly)
+            self.chunk_ce_weight    = min(1.0, 0.5 + 0.05 * (epoch - PHASE_BOUND[0]))   # λ_chunk : 0.5 → 1.0 (10 epoch)
+            self.top_k_ratio        = max(0.3, 0.6 - 0.03*(epoch - PHASE_BOUND[0]))     # Top-k ratio: 0.6 → 0.3 (linearly)
             self.ce_weight          = 0.0
-            self.temperature        = 1.0                               # fixed
+            self.temperature        = 1.0                                               # fixed
         
         # ───────────────────── Phase-2 ─────────────────────
-        else:                          
-            phase, lr, wd, t_max = 2, 1e-4, 5e-5, 25 # (= 15 × 1.0)
+        elif epoch > PHASE_BOUND[1]:                          
+            phase, lr, wd, t_max    = 2, 1e-4, 5e-5, 25                                 # (= 15 × 1.0)
             self.lambda_ent         = 0.0
             self.contrastive_weight = 0.0
             self.chunk_ce_weight    = 0.0
             self.top_k_ratio        = 0.0
-            self.ce_weight          = 1.0
+            self.ce_weight          = min(1.0, 0.5 + 0.02 * (epoch - PHASE_BOUND[1]))   # 0.5 → 1.0
             self.temperature        = 1.0
             
         # ─────── Gradient gate ───────
@@ -495,12 +495,12 @@ class TemporalBranchTrainer_BC(BaseTrainer):
             p.requires_grad = (phase == 2)
 
         # Reconfigure optimizer/scheduler per phase
-        self.configure_optimizer_scheduler(lr, wd, t_max, phase)
+        frozen = self.configure_optimizer_scheduler(lr, wd, t_max, phase)
         
         # SupConLoss sampling scheduling (e.g., threshold, top-k mask, etc.)
         self.contrastive_loss_fn.schedule_params(epoch, self.max_epoch)
         
-        return phase
+        return phase, frozen
 
     def configure_optimizer_scheduler(self, lr, weight_decay, t_max, phase):
         """
@@ -517,7 +517,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
         lr_as       = lr * lr_scale_as       # lr for AttnScorer
         # ------------------------------------------------------------------
 
-        pg_decay, pg_nodecay = [], []
+        pg_decay, pg_nodecay, frozen = [], [], []
 
         def add_param(param, name, lr_this):
             is_nd = ("bias" in name or "LayerNorm" in name)
@@ -541,6 +541,9 @@ class TemporalBranchTrainer_BC(BaseTrainer):
         for module, lr_mod in modules:
             for n, p in module.named_parameters():
                 if not p.requires_grad:
+                    frozen.append(n)
+                    if p.grad is not None:
+                        p.grad = None
                     continue
                 add_param(p, n, lr_mod)
 
@@ -550,7 +553,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
             self.optimizer, T_max=t_max, eta_min=1e-6
         )
         # self.scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(self.optimizer, T_0=10, T_mult=2, eta_min=1e-6)
-
+        return frozen
     
     # ----------------------------------------------------------
     # helper (already imported in your module header once)
@@ -592,19 +595,19 @@ class TemporalBranchTrainer_BC(BaseTrainer):
 
         # ───── per-session loop ──────────────────────────────
         for b in range(B):
-            chunks = chunk_tensors[b].float().to(self.device)      # (T,1,128)
+            chunks = chunk_tensors[b].float().to(self.device)                                           # (T,1,128)
             T      = chunks.size(0)
             label  = batch_labels[b]
             sid    = batch_sids[b]
 
             print(f"[DEBUG] Session {sid}  #chunks={T}")
 
-            # 1) encode all chunks at once  (T,1,128) ➜ (1,T,D)
-            chunk_emb = self.forward_single_chunk_checkpoint(chunks)  # (T,D)
-            chunk_emb = chunk_emb.unsqueeze(0)                        # (1,T,D)
+            # 1) Extract rPPG and its embeddings of all chunks at once (T,1,128) ➜ (1,T,D)
+            chunk_emb = self.forward_single_chunk_checkpoint(chunks)                                    # (T,D)
+            chunk_emb = chunk_emb.unsqueeze(0)                                                          # (1,T,D)
             
             # ──────── per-chunk debug & t-SNE ───────────────
-            for idx, cemb in enumerate(chunk_emb[0]):                # iterate T chunks
+            for idx, cemb in enumerate(chunk_emb[0]):                                                   # iterate T chunks
                 print(f"  Chunk {idx}: mean={cemb.mean():.4f}, std={cemb.std():.4f}")
                 self.chunk_embeddings_for_tsne.append(cemb.detach().cpu().numpy())
                 self.chunk_labels_for_tsne.append(label)
@@ -612,56 +615,83 @@ class TemporalBranchTrainer_BC(BaseTrainer):
 
             # 2) attention scorer 
             attn_soft, raw_scaled, st_alpha = self.attn_scorer(
-                chunk_emb,                               # (1,T,1)
-                temperature=self.temperature,            # τ  (phase-adaptive)
-                epoch=epoch,                             # epoch index
+                chunk_emb,                                                                              # (1,T,1)
+                temperature=self.temperature,                                                           # τ  (phase-adaptive)
+                epoch=epoch,                                                                            # epoch index
             )                    
             print(f"[DEBUG] Session {sid}  #chunks={T}, σ_running={self.attn_scorer.running_score_std.item():.3f}")
             
-            # 3) build α  – soft in Phase-0, ST-Top-K in Phase-1
-            if phase == 0:      # Phase-0 softmax
-                alpha = attn_soft 
+            # ─── Phase 0: SupCon + Sparsity ───────────────────────
+            if phase == 0:      
+                # build α (softmax in Phase-0) and entropy
+                alpha = attn_soft
                 entropy_attn_soft = -(alpha * alpha.clamp_min(1e-8).log()).sum(dim=1).mean()
-            elif phase == 1:    # Phase-1 ST-Top-K
+                
+                # apply α before projection
+                gated_emb   = chunk_emb * alpha                                                         # (1,T,D)
+                proj_embeds = self.chunk_projection(gated_emb)                                          # (1,T,128)
+                
+                # SupCon collection
+                proj_for_supcon.append(proj_embeds.squeeze(0))
+                labels_for_supcon.append(torch.full((T,), label, dtype=torch.long, device=self.device))
+            
+            # ─── Phase 1: Chunk-CE with ST-TopK ─────────────────
+            elif phase == 1:
+                # just in case
                 if len(raw_scaled.squeeze(0).squeeze(-1)) < 1:
                     print("Empty attention scores – skip this session")
                     continue
-                k  = min(T, max(6, int(T * self.top_k_ratio)))
+                if st_alpha is None:
+                    raise RuntimeError(f"st_alpha=None in Phase1!!! epoch={epoch}")
                 
-                alpha_mask = straight_through_topk(raw_scaled, k=k, soft_branch="entmax_alpha", st_alpha=st_alpha) # (1, T)
+                # Hard-Soft with selected Top-K mask (forward hard, backward α-entmax)
+                alpha_mask = straight_through_topk(
+                    raw_scaled, k=min(T, max(6, int(T * self.top_k_ratio)))
+                    , soft_branch="entmax_alpha", st_alpha=st_alpha
+                ) # (1, T)
                 
-                mask_bool  = alpha_mask.squeeze(0).bool()           # (T,)
+                # for Top-K monitoring
+                mask_bool  = alpha_mask.squeeze(0).bool()                                               # (T,)
                 print(f"[DEBUG] Top-K selected = {mask_bool.sum().item()} / {T}")
                 
-                alpha = alpha_mask                    # (B,T)
+                # build α (α-Entmax in Phase-1) and entropy
+                alpha = attn_soft                                                                       # (B,T)
                 entropy_attn_soft = -(attn_soft * attn_soft.clamp_min(1e-8).log()).sum(dim=1).mean()
-            else:               # Phase-2 raw scores
-                alpha = torch.ones_like(raw_scaled)   # (1,T,1)
-                entropy_attn_soft = 0
-
-            # 4) apply α before projection  (keeps grad path)
-            if phase == 0:
-                gated_emb   = chunk_emb * alpha                           # (1,T,D)
-                proj_embeds = self.chunk_projection(gated_emb)            # (1,T,128)
-
-            # 5-A) SupCon collection
-            if phase == 0:
-                proj_for_supcon.append(proj_embeds.squeeze(0))
-                labels_for_supcon.append(torch.full((T,), label,
-                                    dtype=torch.long, device=self.device))
-
-            # 5-B) Top-K chunk CE  (Phase-1)
-            if phase == 1:
-                logits_all   = self.chunk_aux_classifier(chunk_emb.squeeze(0))                  # (T,C)
-                lbl_all      = torch.full((T,), label, device=self.device)                      # (T)
-                ce_per_chunk = self.aux_criterion(logits_all, lbl_all)                          # scalar
-                alpha_prob   = alpha.squeeze(0)                                                 # (T,)
-                weighted_ce  = (alpha_prob * ce_per_chunk).sum() / (alpha_prob.sum() + 1e-8)    # ← eps
+                
+                # ChunkAuxClassifier & Focal CE ―― only this block tracked
+                with torch.no_grad():
+                    # projection, pooling -> no_grad
+                    _ = self.chunk_projection(chunk_emb)
+                    _ = self.pooling(chunk_emb, raw_scaled)
+                
+                # gated embedding (forward hard, backward soft)
+                gated_emb = chunk_emb * alpha_mask.unsqueeze(-1)                                        # (1,T,D)
+                
+                # Top-K chunk-level logits & per-chunk loss
+                logits_all   = self.chunk_aux_classifier(gated_emb.squeeze(0))                          # (T,C)
+                lbl_all      = torch.full((T,), label, device=self.device)                              # (T)
+                ce_per_chunk = self.aux_criterion(logits_all, lbl_all)                                  # scalar
+                
+                # weighted sum → scalar chunk CE (backward soft)
+                alpha_prob = alpha_mask.squeeze(0)                                                   # (T,)
+                weighted_ce  = (alpha_prob * ce_per_chunk).sum() / (alpha_prob.sum() + 1e-8)            # ← eps
                 chunk_ce_losses.append(weighted_ce)
+            
+            # ─── Phase 2: GatedPooling + Session-CE ───────────────
+            else:              
+                alpha = torch.ones_like(raw_scaled)                                                     # (1,T,1)
+                entropy_attn_soft = 0
+                
+                with torch.no_grad():
+                    # supcon, chunkCE related modules no_grad
+                    _ = self.chunk_projection(chunk_emb)
+                    _ = self.chunk_aux_classifier(chunk_emb.squeeze(0))
 
-            # 6) session-level pooling
+
+            # 3) session-level pooling
             pooled, attn_gated, ent_gated = self.pooling(
                 chunk_emb, raw_scaled, return_weights=True, return_entropy=True)
+            
             # ★──────── session-level t-SNE ───────────────────
             sess_emb = pooled.squeeze(0)                              # (D,)
             self.session_embeddings_for_tsne.append(sess_emb.detach().cpu().numpy())
@@ -671,12 +701,12 @@ class TemporalBranchTrainer_BC(BaseTrainer):
             session_embeds.append(pooled.squeeze(0))
             target_labels.append(label)
 
-            # 7) entropy bookkeeping
+            # 4) entropy bookkeeping
             entropy_attn_list.append(entropy_attn_soft)
             entropy_gated_list.append(ent_gated)
             entropy_list.append(entropy_attn_soft if phase < 2 else ent_gated)
 
-            # 8) OPTIONAL chunk-level debug
+            # 5) OPTIONAL chunk-level debug
             if phase < 2:
                 attn_np = attn_soft.detach().cpu().squeeze().numpy()
                 print(f"[DEBUG][Attn Weights] {attn_np.tolist()}")
@@ -698,18 +728,18 @@ class TemporalBranchTrainer_BC(BaseTrainer):
         else:
             contrastive_term = None
 
-        # Session CE (always computed)
-        sess_mat   = torch.stack(session_embeds, 0)
-        label_vec  = torch.tensor(target_labels, dtype=torch.long, device=self.device)
-        ce_logits  = self.classifier(sess_mat)
-        ce_loss    = self.criterion(ce_logits, label_vec)
+        # Sparsity
+        sparsity_loss = torch.stack(entropy_list).mean()
 
         # Chunk CE (Phase-1)
         chunk_ce_raw = (torch.stack(chunk_ce_losses).mean()
                         if chunk_ce_losses else torch.tensor(0.0, device=self.device))
 
-        # Sparsity (for monitoring)
-        sparsity_loss = torch.stack(entropy_list).mean()
+        # Session CE (always computed)
+        sess_mat   = torch.stack(session_embeds, 0)
+        label_vec  = torch.tensor(target_labels, dtype=torch.long, device=self.device)
+        ce_logits  = self.classifier(sess_mat)
+        ce_loss    = self.criterion(ce_logits, label_vec)
 
         # ───── scaled terms (for debug table) ───────────────
         ce_loss_scaled          = self.ce_weight      * ce_loss
@@ -822,7 +852,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
             entropy_gated_all = []
 
             # === Temporary call for logging current scheduling phase only ===
-            phase = self.update_training_state(epoch)
+            phase, frozen = self.update_training_state(epoch)
 
             # === Epoch Settings Print ===
             print("\n" + "=" * 80)
@@ -840,7 +870,14 @@ class TemporalBranchTrainer_BC(BaseTrainer):
                 print(f"   ▸ SupConTemperature  : {self.contrastive_loss_fn.temperature:.2f}")
                 print(f"   ▸ SoftmaxTemperature : {self.temperature:.2f}")
             print("-" * 80)
-
+            print(f"❄️ Frozen Modules:")
+            if frozen:
+                for module_name in frozen:
+                    print(f"   ▸ {module_name}")
+            else:
+                print("   ▸ [None]")
+            print("-" * 80)
+                
             tbar = tqdm(data_loader["train"], desc=f"Epoch {epoch}", ncols=80)
             running_loss = 0.0
             all_preds, all_labels = [], []
