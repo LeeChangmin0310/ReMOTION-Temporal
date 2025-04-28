@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from typing import *
 from tqdm import tqdm
 from scipy.signal import butter, filtfilt
 from torch.nn.functional import cosine_similarity
@@ -49,7 +50,7 @@ def reconstruct_sessions(self, batch=None, idx=None, epoch=None, phase="train"):
             self.chunk_labels_for_tsne.append(label)
 
         # === Attention ===
-        attn_weights, raw_scores = self.attn_scorer(chunk_embeds, temperature=self.temperature, epoch=epoch)  # (1, T, 1)
+        attn_weights, raw_scores, _ = self.attn_scorer(chunk_embeds, temperature=self.temperature, epoch=epoch)  # (1, T, 1)
         pooled, attn_gated, entropy_gated = self.pooling(chunk_embeds, raw_scores, return_weights=True, return_entropy=True)
         if attn_weights is not None:
             entropy = -torch.sum(attn_weights * torch.log(attn_weights + 1e-8), dim=1).mean()
@@ -131,8 +132,43 @@ def run_tsne_and_plot(self, level="chunk", epoch=0, phase="train"):
         self.session_embeddings_for_tsne.clear()
         self.session_labels_for_tsne.clear()
 
-# --- Utility
-def straight_through_topk(raw_scores: torch.Tensor, k: int, soft_branch: str = "entmax15"):
+
+# --- Utility function for Focal Loss ---
+class FocalLoss(nn.Module):
+    """
+    Class-balanced focal loss.
+    Args
+    ----
+    alpha : weight for the rare class (scalar or 1-D tensor)
+    gamma : focusing parameter
+    reduction : "none" | "mean" | "sum"
+    """
+    def __init__(self, alpha: float = 0.5, gamma: float = 2.0, reduction: str = "none") -> None:
+        super().__init__()
+        self.alpha     = alpha          
+        self.gamma     = gamma
+        self.reduction = reduction
+
+    def forward(self, logits: torch.Tensor,
+                targets: torch.Tensor) -> torch.Tensor:
+        # CE per-sample
+        ce_loss = F.cross_entropy(logits, targets,
+                                  reduction="none", label_smoothing=0.0)
+        # Convert to probability of correct class
+        pt = torch.exp(-ce_loss)
+        focal = self.alpha * (1. - pt) ** self.gamma * ce_loss
+
+        if self.reduction == "mean":
+            return focal.mean()
+        elif self.reduction == "sum":
+            return focal.sum()
+        else:                               # "none"
+            return focal
+
+# --- Utility function for straight-through Top-K attention ---
+def straight_through_topk(raw_scores: torch.Tensor, k: int, 
+                          soft_branch: Literal["softmax", "entmax15", "entmax_alpha"] = "entmax_alpha", 
+                          st_alpha: float = 1.9):
     """
     Forward : hard 1/0 Top-K mask
     Backward: soft probs (Entmax or Softmax) for gradient
@@ -140,15 +176,19 @@ def straight_through_topk(raw_scores: torch.Tensor, k: int, soft_branch: str = "
         raw_scores : (B,T,1)  –  logit or pre-score
         k          : Top-K
         soft_fn    : softmax  or  partial(entmax15)
+        st_alpha   : straight-through alpha for a-entmax (default: 1.5)
     """
     B, T, _ = raw_scores.shape
     logits  = raw_scores.view(B, T)
 
     # ---- soft branch (∂L/∂logits) -----------------------------------------
-    if soft_branch == "entmax15":
-        probs = entmax.entmax15(logits, dim=1)
-    else:
+    if soft_branch == "softmax":
         probs = torch.softmax(logits, dim=1)
+    elif soft_branch == "entmax15":
+        probs = entmax.entmax15(logits, dim=1)
+    else:                                   # α-entmax
+        probs = entmax.entmax_bisect(logits, alpha=st_alpha, dim=1)
+
 
     # ---- hard branch (forward only) ---------------------------------------
     _, top_idx = torch.topk(logits, k=min(k, T), dim=1)
@@ -157,7 +197,6 @@ def straight_through_topk(raw_scores: torch.Tensor, k: int, soft_branch: str = "
     # ---- straight-through --------------------------------------------------
     # forward : hard , backward : probs
     return hard + (probs - probs.detach())      # ≡ probs.grad , hard.forward  <- (B,T)
-
 
 
 # --- Utility functions for supervised contrastive loss with top-k attention-based chunk selection ---

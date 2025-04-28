@@ -223,12 +223,11 @@ from modules.ProjectionHead import ProjectionHead
 from modules.ChunkForward import ChunkForwardModule
 from modules.ClassificationHead import ClassificationHead
 from modules.ChunkAuxClassifier import ChunkAuxClassifier
-# from modules.TopKPooling import TopKSoftPooling
-# from modules.GatedAttentionPooling import GatedAttentionPooling
 
-from tools.utils import SupConLossTopK
+from tools.utils import SupConLossTopK, FocalLoss
 from tools.utils import reconstruct_sessions, run_tsne_and_plot, straight_through_topk
 
+PHASE_BOUND = [15, 25]
 
 class TemporalBranchTrainer_BC(BaseTrainer):
     """
@@ -289,7 +288,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
         
         wandb.init(
             project="TemporalReMOTION",
-            name=f"Exp_Arsl_FINALPIPE_CEsoftmax",
+            name=f"Exp_Arsl_FINALPIPE",
             # config=cfg_dict,
             dir="./wandb_logs"
         )
@@ -371,17 +370,12 @@ class TemporalBranchTrainer_BC(BaseTrainer):
         """SupConLossTopK: supervised contrastive loss using top-K attended chunks per session"""
         self.contrastive_loss_fn = SupConLossTopK(temperature=0.1)
         
-        """CrossEntropyLoss: standard cross-entropy loss for chunk-level classification(phase1)"""
-        self.aux_criterion = nn.CrossEntropyLoss(reduction='none')
+        """FocalLoss: Standard α-balanced focal loss for chunk-level classification (phase1)"""
+        self.aux_criterion = FocalLoss(alpha=0.5, gamma=2.0, reduction="none")
         
-        """CrossEntropyLoss: standard cross-entropy loss for session-level classification(phase2)"""
-        self.criterion = nn.CrossEntropyLoss() # <================================ HOW ABOUT FOCAL LOSS???
-        
-        """
-        AlignCosineLoss: cosine distance between Top-K pooled vs Gated pooled embeddings.
-        Encourages representational alignment across attention streams.
-        self.cosinse_criterion = AlignCosineLoss()
-        """
+        """CrossEntropyLoss: standard cross-entropy loss for session-level classification (phase2)"""
+        self.criterion = nn.CrossEntropyLoss()
+
 
         # ------------------------------ Optimizer & Scheduler -----------------------------
         self.optimizer = None
@@ -443,28 +437,20 @@ class TemporalBranchTrainer_BC(BaseTrainer):
         - Controls gradient flow
         - Configures optimizer/scheduler
         
-        Phase 0 (0–19): SupCon + Entropy Temperature Control
-        Phase 1 (20–34): Chunk CE + Top-K
-        Phase 2 (35–49): Final CE + Classifier + GatedPooling
+        Phase 0 (0–14): SupCon + Entropy Temperature Control
+        Phase 1 (15–24): Chunk CE + Top-K
+        Phase 2 (25–49): Final CE + Classifier + GatedPooling
         """
-        # ───────────────────── Phase-wise setup ─────────────────────
-        PHASE0_END = 19
-        PHASE1_END = 34
-        PHASE2_END = self.max_epoch - 1
         
         # ───────────────────── Phase-0 ─────────────────────
-        if epoch <= PHASE0_END:          # Phase-0   (0–19)
-            phase, lr, wd, t_max = 0, 3e-4, 1e-4, 20 # (= phase length × 1.0)
+        if epoch < PHASE_BOUND[0]:                                  # Phase-0   (0–14)
+            phase, lr, wd, t_max = 0, 3e-4, 1e-4, 15                # (= phase length × 1.0)
             
-            # ① SupCon λ : 0-4 (1→0.6) , 5-19 (0.6→0.3)
-            if  epoch < 10:
-                self.contrastive_weight = 1.0 - 0.05 * epoch        # 1.0→0.55
-            else:
-                self.contrastive_weight = 0.55 - 0.02 * (epoch-10)  # 0.55→0.35
-            self.contrastive_weight = max(0.3, self.contrastive_weight)
-            self.lambda_ent      = 0.1
-            self.chunk_ce_weight = 0.0
-            self.ce_weight       = 0.0
+            self.contrastive_weight = max(0.4, 1.0 - 0.04 * epoch)  # SupCon λ (diversity to sparsity) 
+            self.lambda_ent         = 0.1
+            self.chunk_ce_weight    = 0.0
+            self.top_k_ratio        = 0.0
+            self.ce_weight          = 0.0
             
             # adaptive τ  (0.5 ≤ τ ≤ 1.2)
             if self.avg_entropy_attn is None:
@@ -474,26 +460,23 @@ class TemporalBranchTrainer_BC(BaseTrainer):
                 self.temperature = max(0.7, min(1.2, tau))
         
         # ───────────────────── Phase-1 ─────────────────────
-        elif epoch <= PHASE1_END:        
-            phase, lr, wd, t_max = 1, 2e-4, 5e-5, 20 # (= 15 × 1.3 ≈ 20)
+        elif epoch < PHASE_BOUND[1]:        
+            phase, lr, wd, t_max = 1, 2e-4, 5e-5, 10                    # (= 15 × 1.3 ≈ 20)
             
-            # ② Chunk-CE λ : 20-24 = 0.3, 25-34 = 0.5→0.7
-            if epoch <= 24:
-                self.chunk_ce_weight = 0.35
-            else:
-                self.chunk_ce_weight = 0.35 + 0.025 * (epoch-25)        # 0.35→0.60
             self.contrastive_weight = 0.0                               # Weak SupCon
             self.lambda_ent         = 0.0
-            self.chunk_ce_weight    = min(0.60, self.chunk_ce_weight)
+            self.chunk_ce_weight    = 0.35 + 0.025 * (epoch - 15)       # λ_chunk : 0.35 → 0.60 (10 epoch)
+            self.top_k_ratio        = 0.45 - 0.02 * (epoch - 15)        # Top-k ratio: 0.45 → 0.25 (linearly)
             self.ce_weight          = 0.0
             self.temperature        = 1.0                               # fixed
         
         # ───────────────────── Phase-2 ─────────────────────
         else:                          
-            phase, lr, wd, t_max = 2, 1e-4, 5e-5, 15 # (= 15 × 1.0)
+            phase, lr, wd, t_max = 2, 1e-4, 5e-5, 25 # (= 15 × 1.0)
             self.lambda_ent         = 0.0
             self.contrastive_weight = 0.0
             self.chunk_ce_weight    = 0.0
+            self.top_k_ratio        = 0.0
             self.ce_weight          = 1.0
             self.temperature        = 1.0
             
@@ -503,16 +486,13 @@ class TemporalBranchTrainer_BC(BaseTrainer):
         for p in self.temporal_branch.parameters():
             p.requires_grad = True
         for p in self.chunk_projection.parameters():
-            p.requires_grad = (phase < 1)
+            p.requires_grad = (phase == 0)
         for p in self.chunk_aux_classifier.parameters():
             p.requires_grad = (phase == 1)
         for p in self.pooling.parameters():
             p.requires_grad = (phase == 2)
         for p in self.classifier.parameters():
             p.requires_grad = (phase == 2)
-
-        # Top-K Ratio
-        self.top_k_ratio = max(0.3, 0.6 - 0.3 * (epoch / PHASE2_END))
 
         # Reconfigure optimizer/scheduler per phase
         self.configure_optimizer_scheduler(lr, wd, t_max, phase)
@@ -528,11 +508,11 @@ class TemporalBranchTrainer_BC(BaseTrainer):
         Automatically resets learning rate and weight decay per phase.
 
         * phase 0 : AttnScorer LR = 1.00 × lr
-        * phase 1 : AttnScorer LR = 1.00 × lr   
+        * phase 1 : AttnScorer LR = 2.00 × lr   
         * phase 2 : AttnScorer LR = 0.50 × lr   (fine-tuning)
         """
         # ------------------------------------------------------------------
-        lr_scale_as = 1.0 if phase < 2 else 0.5
+        lr_scale_as = 1.0 if phase == 0 else (2.0 if phase == 1 else 0.5)
         lr_raw      = lr                     # default lr per phase
         lr_as       = lr * lr_scale_as       # lr for AttnScorer
         # ------------------------------------------------------------------
@@ -560,8 +540,9 @@ class TemporalBranchTrainer_BC(BaseTrainer):
 
         for module, lr_mod in modules:
             for n, p in module.named_parameters():
-                if p.requires_grad:
-                    add_param(p, n, lr_mod)
+                if not p.requires_grad:
+                    continue
+                add_param(p, n, lr_mod)
 
         # --------- Optimizer / Scheduler ---------
         self.optimizer = optim.AdamW(pg_decay + pg_nodecay)
@@ -630,7 +611,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
             # ────────────────────────────────────────────────
 
             # 2) attention scorer 
-            attn_soft, raw_scaled = self.attn_scorer(
+            attn_soft, raw_scaled, st_alpha = self.attn_scorer(
                 chunk_emb,                               # (1,T,1)
                 temperature=self.temperature,            # τ  (phase-adaptive)
                 epoch=epoch,                             # epoch index
@@ -646,37 +627,41 @@ class TemporalBranchTrainer_BC(BaseTrainer):
                     print("Empty attention scores – skip this session")
                     continue
                 k  = min(T, max(6, int(T * self.top_k_ratio)))
-                alpha_mask = straight_through_topk(raw_scaled, k=k) # (1, T)
+                
+                alpha_mask = straight_through_topk(raw_scaled, k=k, soft_branch="entmax_alpha", st_alpha=st_alpha) # (1, T)
+                
                 mask_bool  = alpha_mask.squeeze(0).bool()           # (T,)
-                alpha = alpha_mask.unsqueeze(-1)                    # (1,T,1)
                 print(f"[DEBUG] Top-K selected = {mask_bool.sum().item()} / {T}")
+                
+                alpha = alpha_mask                    # (B,T)
                 entropy_attn_soft = -(attn_soft * attn_soft.clamp_min(1e-8).log()).sum(dim=1).mean()
             else:               # Phase-2 raw scores
                 alpha = torch.ones_like(raw_scaled)   # (1,T,1)
                 entropy_attn_soft = 0
 
             # 4) apply α before projection  (keeps grad path)
-            gated_emb   = chunk_emb * alpha                           # (1,T,D)
-            proj_embeds = self.chunk_projection(gated_emb)            # (1,T,128)
+            if phase == 0:
+                gated_emb   = chunk_emb * alpha                           # (1,T,D)
+                proj_embeds = self.chunk_projection(gated_emb)            # (1,T,128)
 
             # 5-A) SupCon collection
-            if phase < 1:
+            if phase == 0:
                 proj_for_supcon.append(proj_embeds.squeeze(0))
                 labels_for_supcon.append(torch.full((T,), label,
                                     dtype=torch.long, device=self.device))
 
             # 5-B) Top-K chunk CE  (Phase-1)
             if phase == 1:
-                logits_all = self.chunk_aux_classifier(chunk_emb.squeeze(0))  # (T,C)
-                lbl_all    = torch.full((T,), label, device=self.device)      # (T)
-                ce_per_chunk     = self.aux_criterion(logits_all, lbl_all)              # scalar
-                weighted_ce  = (alpha_mask.squeeze(0) * ce_per_chunk).sum() / (
-                                alpha_mask.squeeze(0).sum() + 1e-8)  # ← eps
+                logits_all   = self.chunk_aux_classifier(chunk_emb.squeeze(0))                  # (T,C)
+                lbl_all      = torch.full((T,), label, device=self.device)                      # (T)
+                ce_per_chunk = self.aux_criterion(logits_all, lbl_all)                          # scalar
+                alpha_prob   = alpha.squeeze(0)                                                 # (T,)
+                weighted_ce  = (alpha_prob * ce_per_chunk).sum() / (alpha_prob.sum() + 1e-8)    # ← eps
                 chunk_ce_losses.append(weighted_ce)
 
             # 6) session-level pooling
             pooled, attn_gated, ent_gated = self.pooling(
-                gated_emb, raw_scaled, return_weights=True, return_entropy=True)
+                chunk_emb, raw_scaled, return_weights=True, return_entropy=True)
             # ★──────── session-level t-SNE ───────────────────
             sess_emb = pooled.squeeze(0)                              # (D,)
             self.session_embeddings_for_tsne.append(sess_emb.detach().cpu().numpy())
@@ -741,7 +726,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
             loss_total = contrastive_term_scaled + self.lambda_ent * sparsity_loss
         elif phase == 1:
             loss_total = chunk_ce_loss_scaled
-        else:                              # phase 2
+        else:                             
             loss_total = ce_loss_scaled
         # ----------------------------------------------------
 

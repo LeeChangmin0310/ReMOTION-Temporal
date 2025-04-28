@@ -65,21 +65,22 @@ class AttnScorer(nn.Module):
         gamma      = (sigma_star / (sigma + 1e-4))
         gamma      = float(max(0.5, min(2.0, gamma)))         # clamp
         raw_scaled = raw_scores * gamma                       # scale
+        alpha = None
         
         # --- choose attention kernel ----------------------
-        if epoch < 10:                                                      # Phase 0-a:  Softmax explore
+        if epoch < 15:                                                      # Phase 0:  Softmax diversity explore
             attn = torch.softmax(raw_scaled / temperature, dim=1)
-        elif epoch < 20:                                                    # Phase 0-b:  α-Entmax warm-up
-            alpha = 2.0 - 0.1 * max(0, epoch - 4)                           # α 1.9→1.6 linearly
-            attn  = entmax.entmax_bisect(raw_scaled, alpha=alpha, dim=1)
-        elif epoch < 35:                                                    # Phase 1:    Entmax15 sparse
-            attn  = entmax.entmax15(raw_scaled, dim=1)
+            
+        elif 15 <= epoch < 25:                                              # Phase 1:  α-Entmax discriminativity explore        
+            alpha = 1.9 - 0.03 * (epoch - 15)                                     # α: 1.9 → 1.6  (10 ep ×0.03) linearly over 10ep
+            attn = entmax.entmax_bisect(raw_scaled, alpha=alpha, dim=1)           # (B,T)
+            
         else:                                                               # Phase 2:    scorer fine-tune
-            attn  = None                                                    # use raw_scores only
+            attn  = None                                                          # use raw_scores only
         
         # 4) DEBUG
-        if self.training and (torch.rand(1).item() < 0.05):   # 5 % 확률
+        if self.training and (torch.rand(1).item() < 0.05):   # 5 % debug
             print(f"[AttnScorer] epoch={epoch:02d} | σ={sigma:.3f} "
                   f"→ γ={gamma:.2f} | kernel={('soft','α','15','raw')[min(3,epoch//15)]}")
-        
-        return attn, raw_scaled
+
+        return attn, raw_scaled, alpha
