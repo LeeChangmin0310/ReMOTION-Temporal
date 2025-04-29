@@ -72,7 +72,7 @@ class AttnScorer(nn.Module):
             attn = torch.softmax(raw_scaled / temperature, dim=1)
             
         elif 15 <= epoch < 25:                                              # Phase 1:  α-Entmax discriminativity explore        
-            alpha = 1.9 - 0.03 * (epoch - 15)                                     # α: 1.9 → 1.6  (10 ep ×0.03) linearly over 10ep
+            alpha = 1.8 - 0.02 * (epoch - 15)                                     # α: 1.8 → 1.6  (10 ep ×0.03) linearly over 10ep
             attn = entmax.entmax_bisect(raw_scaled, alpha=alpha, dim=1)           # (B,T)
             
         else:                                                               # Phase 2:    scorer fine-tune

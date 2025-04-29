@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 
 from config import get_config
 from trainer import trainer
-from unsupervised_encoders.unsupervised_predictor import unsupervised_predict
+# from unsupervised_extractors.unsupervised_predictor import unsupervised_predict
 
 from dataset import data_loader
 from dataset.data_loader.collate_fn import custom_collate_fn
@@ -79,16 +79,19 @@ def select_trainer(config, data_loader_dict):
             return trainer.PhysFormerTrainer_BC.PhysFormerTrainer(config, data_loader_dict)
         elif config.ENCODER.NAME == "RhythmFormer":
             return trainer.RhythmFormerTrainer_BC.RhythmFormerTrainer(config, data_loader_dict)
-        '''
-        if config.ENCODER.NAME == 'TemporalBranch':
-            return trainer.TemporalBranchTrainer_BC.TemporalBranchTrainer_BC(config, data_loader_dict)
         elif config.ENCODER.NAME == "PhysMamba":
             return trainer.PhysMambaTrainer_BC.PhysMambaTrainer(config, data_loader_dict)
+        '''
+        if config.ENCODER.NAME == 'MTDE':
+            return trainer.MTDETrainer_BC.MTDETrainer_BC(config, data_loader_dict)
         else:
             raise ValueError("Your Model is Not Supported Yet!")
     
+    else:
+        raise ValueError("Set your LABEL_COLUMN!")
+    
+'''
     elif config.TEST.DATA.LABEL_COLUMN in ['3C_Arsl', '3C_Vlnc']:
-        '''
         Not Supported Yet !
         Will be added in the future.
         
@@ -110,14 +113,13 @@ def select_trainer(config, data_loader_dict):
             return trainer.PhysFormerTrainer_3C.PhysFormerTrainer(config, data_loader_dict)
         elif config.ENCODER.NAME == "RhythmFormer":
             return trainer.RhythmFormerTrainer_3C.RhythmFormerTrainer(config, data_loader_dict)
-        '''
-        if config.ENCODER.NAME == "PhysMamba":
+        elif config.ENCODER.NAME == "PhysMamba":
             return trainer.PhysMambaTrainer_3C.PhysMambaTrainer(config, data_loader_dict)
         else:
             raise ValueError("Your Model is Not Supported Yet!")
-    else:
-        raise ValueError("Set your LABEL_COLUMN!")
+'''
 
+'''
 def unsupervised_method_inference(config, data_loader):
     """Runs unsupervised method inference based on the method specified in the config."""
     if not config.UNSUPERVISED.METHOD:
@@ -139,6 +141,7 @@ def unsupervised_method_inference(config, data_loader):
             unsupervised_predict(config, data_loader, "OMIT")
         else:
             raise ValueError("Not supported unsupervised method!")
+'''
 
 def create_data_loaders(loader_cls, config):
     """
@@ -291,6 +294,9 @@ if __name__ == "__main__":
             elif config.ReMOTION_MODE == "only_test":
                 data_loader_dict = create_data_loaders(loader_cls, config)
                 test(config, data_loader_dict)
+    else:
+        raise ValueError("Unsupported ReMOTION_MODE!")
+    '''
     elif config.ReMOTION_MODE == "unsupervised_method":
         loader_cls = data_loader.MAHNOBHCILoader.MAHNOBHCILoader
         unsupervised_data = loader_cls(name="unsupervised",
@@ -304,5 +310,4 @@ if __name__ == "__main__":
                                        worker_init_fn=seed_worker, generator=general_generator)
         }
         unsupervised_method_inference(config, data_loader_dict)
-    else:
-        raise ValueError("Unsupported ReMOTION_MODE!")
+    '''

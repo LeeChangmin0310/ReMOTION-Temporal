@@ -8,7 +8,7 @@ import numpy as np
 import math
 from scipy import signal
 from scipy import linalg
-from unsupervised_encoders import utils
+from unsupervised_extractors import utils
 
 
 def GREEN(frames):

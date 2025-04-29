@@ -20,35 +20,35 @@ class ChunkForwardModule(nn.Module):
 
     def __init__(
         self,
+        extractor: nn.Module,
         encoder: nn.Module,
-        temporal_branch: nn.Module,
         use_checkpoint: bool = False,
-        freeze_encoder: bool = True,
+        freeze_extractor: bool = True,
         micro_bs: int = 24,          # max chunks processed per encoder call
     ):
         super().__init__()
+        self.extractor = extractor
         self.encoder = encoder
-        self.temporal_branch = temporal_branch
         self.use_checkpoint = use_checkpoint
-        self.freeze_encoder = freeze_encoder
+        self.freeze_extractor = freeze_extractor
         self.micro_bs = micro_bs
 
         # Freeze encoder weights if requested
-        if self.freeze_encoder:
-            for p in self.encoder.parameters():
+        if self.freeze_extractor:
+            for p in self.extractor.parameters():
                 p.requires_grad = False
-            self.encoder.eval()
+            self.extractor.eval()
 
     # ------------------------------------------------------------------ #
-    # Helper for gradient-checkpointing on TemporalBranch only
+    # Helper for gradient-checkpointing on MTDE only
     # ------------------------------------------------------------------ #
-    def _temporal(self, rppg):
-        return self.temporal_branch(rppg)
+    def _encoder(self, rppg):
+        return self.encoder(rppg)
 
     # ------------------------------------------------------------------ #
-    # Encoder forward with memory-safe micro-batching
+    # Extractor forward with memory-safe micro-batching
     # ------------------------------------------------------------------ #
-    def _run_encoder(self, x: torch.Tensor) -> torch.Tensor:
+    def _run_extractor(self, x: torch.Tensor) -> torch.Tensor:
         """
         Parameters
         ----------
@@ -62,19 +62,19 @@ class ChunkForwardModule(nn.Module):
             shape (N, T_rppg) – raw rPPG sequence per chunk
         """
 
-        def _enc(sub):
+        def _ex(sub):
             # Encoder is frozen – no gradients, no activation storage
             with torch.no_grad():
-                return self.encoder(sub)
+                return self.extractor(sub)
 
         # If batch is small enough, run once
         if x.size(0) <= self.micro_bs:
-            return _enc(x).detach()               # detach breaks graph
+            return _ex(x).detach()               # detach breaks graph
 
         # Otherwise slice into micro-batches to cap peak memory
         outs = []
         for s in range(0, x.size(0), self.micro_bs):
-            outs.append(_enc(x[s:s + self.micro_bs]))
+            outs.append(_ex(x[s:s + self.micro_bs]))
         return torch.cat(outs, 0).detach()        # (N, T_rppg)
 
     # ------------------------------------------------------------------ #
@@ -94,9 +94,9 @@ class ChunkForwardModule(nn.Module):
 
         # 1) PhysMamba → rPPG
         if x.dim() == 5:                          # video input
-            rppg = self._run_encoder(x)           # (1, T_rppg)
+            rppg = self._run_extractor(x)           # (1, T_rppg)
         else:                                     # rPPG batch
-            rppg = self._run_encoder(x)           # (N, T_rppg)
+            rppg = self._run_extractor(x)           # (N, T_rppg)
 
         # 2) Make rPPG a leaf tensor so TemporalBranch gradients flow
         rppg = rppg.requires_grad_(True)
@@ -105,7 +105,7 @@ class ChunkForwardModule(nn.Module):
         if self.use_checkpoint:
             emb = checkpoint.checkpoint(self._temporal, rppg)
         else:
-            emb = self.temporal_branch(rppg)      # (N, D)
+            emb = self.encoder(rppg)      # (N, D)
 
         return emb
 

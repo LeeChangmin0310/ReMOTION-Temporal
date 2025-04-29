@@ -1,6 +1,6 @@
 """
 
-rPPG → TemporalBranch → Chunk Embedding
+rPPG → MTDE(encoder) → Chunk Embedding
                       ↓
                AttnScorer (raw score)
                       ↓
@@ -13,10 +13,10 @@ rPPG → TemporalBranch → Chunk Embedding
                          ClassificationHead
 
 
-Video session  →  N temporal chunks  ──▶  PhysMamba(encoder, frozen)
+Video session  →  N temporal chunks  ──▶  PhysMamba(extractor, frozen)
                                          │  rPPG 1-D signal
                                          ▼
-                                    TemporalBranch
+                                    MTDE(encoder)
                                          │  chunk-embed z_t  (D=256)
              ┌─────────────┬─────────────┴─────────────┐
              │             │                           │
@@ -38,7 +38,7 @@ Video session  →  N temporal chunks  ──▶  PhysMamba(encoder, frozen)
           rPPG Chunk (from PhysMamba)
                         │
                 ┌──────▼─────────┐
-                │ TemporalBranch │ (Multi-Scale CNN → Embedding)
+                │ MTDE(Encoder)  │ (Multi-Scale CNN → Embedding)
                 └──────┬─────────┘
                        ▼
               Chunk Embedding (B, D)
@@ -83,7 +83,7 @@ Summary:
 
 📌 Epoch 0–20: Exploration Phase
 ───────────────────────────────
-rPPG Chunk → TemporalBranch → Chunk Embedding
+rPPG Chunk → MTDE(encoder) → Chunk Embedding
                          ↓
                   AttnScorer (softmax, T=1.0)
                          ↓
@@ -94,7 +94,7 @@ rPPG Chunk → TemporalBranch → Chunk Embedding
                  SparsityLoss (attention entropy)
 
 🟢 Active Modules:
-- TemporalBranch, AttnScorer, ProjectionHead, SupConLossTopK
+- MTDE(encoder), AttnScorer, ProjectionHead, SupConLossTopK
 - GatedPooling (from epoch 15) → only pooling, no CE
 
 ❌ Frozen:
@@ -119,7 +119,7 @@ Top-K + Threshold → selection
 GatedPooling → session embedding → Classifier (still frozen)
 
 🟠 Active Modules:
-- TemporalBranch, AttnScorer, ProjectionHead
+- MTDE(encoder), AttnScorer, ProjectionHead
 - GatedPooling (from epoch 15)
 - ChunkAuxClassifier (weak CE, epoch 20–34)
 - SupConLossTopK (Top-K based, lower weight)
@@ -164,7 +164,7 @@ GatedPooling → Gated Embedding
         Classifier → CrossEntropy
 
 🟣 Active Modules:
-- TemporalBranch, GatedPooling, Classifier
+- MTDE(encoder), GatedPooling, Classifier
 
 ❄️ Frozen:
 - AttnScorer, ProjectionHead, SupConLossTopK (optionally off)
@@ -177,10 +177,10 @@ GatedPooling → Gated Embedding
 
 📌 Epoch 45–49: Stability Phase
 ───────────────────────────────
-    TemporalBranch → GatedPooling → Classifier → CE Loss
+    MTDE(encoder) → GatedPooling → Classifier → CE Loss
 
 ⚪ Active Modules:
-- TemporalBranch, GatedPooling, Classifier
+- MTDE(encoder), GatedPooling, Classifier
 
 ❌ Off:
 - SupConLossTopK, ChunkAuxClassifier, KL AlignLoss, AttnScorer, ProjectionHead
@@ -206,16 +206,16 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
-from torch.utils.data import DataLoader
 
 from tqdm import tqdm
 from functools import partial
+from torch.utils.data import DataLoader
 from sklearn.metrics import accuracy_score, confusion_matrix, f1_score
 
 from trainer.BaseTrainer import BaseTrainer
-from neural_encoders.model.PhysMamba import PhysMamba
+from neural_extractors.model.PhysMamba import PhysMamba
 
-from decoders.TemporalBranch import TemporalBranch
+from REs.MTDE import MTDE
 
 from modules.AttnScorer import AttnScorer           # Returns pre-softmax raw attn score
 from modules.GatedPooling import GatedPooling       # No attn inside, takes extrernal attn raw score from AttnScorer
@@ -229,9 +229,9 @@ from tools.utils import reconstruct_sessions, run_tsne_and_plot, straight_throug
 
 PHASE_BOUND = [15, 25]
 
-class TemporalBranchTrainer_BC(BaseTrainer):
+class MTDETrainer_BC(BaseTrainer):
     """
-    Session-Level Emotion Recognition Pipeline (TemporalBranchTrainer_BC)
+    Session-Level Emotion Recognition Pipeline (MTDETrainer_BC)
 
     ==============================================
     🎯 Final Phase-based Training Strategy Overview
@@ -277,7 +277,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
     """
 
     def __init__(self, config, data_loader):
-        super(TemporalBranchTrainer_BC, self).__init__()
+        super(MTDETrainer_BC, self).__init__()
         self.device = torch.device(config.DEVICE)
         self.config = config
         self.max_epoch = config.TRAIN.EPOCHS
@@ -288,20 +288,20 @@ class TemporalBranchTrainer_BC(BaseTrainer):
         
         wandb.init(
             project="TemporalReMOTION",
-            name=f"Exp_Arsl_FINAL_NoRes",
+            name=f"Exp_Arsl_FINAL_MTDE",
             # config=cfg_dict,
             dir="./wandb_logs"
         )
 
         # --------------------------- Encoder Initialization ---------------------------
         """Used to extract physiological signals from chunked video input (frozen during training)"""
-        self.encoder = PhysMamba().to(self.device)
-        self.encoder = torch.nn.DataParallel(self.encoder)
-        pretrained_path = os.path.join("./pretrained_encoders", "UBFC-rPPG_PhysMamba_DiffNormalized.pth")
-        self.encoder.load_state_dict(torch.load(pretrained_path, map_location=self.device))
+        self.extractor = PhysMamba().to(self.device)
+        self.extractor = torch.nn.DataParallel(self.extractor)
+        pretrained_path = os.path.join("./pretrained_extractors", "UBFC-rPPG_PhysMamba_DiffNormalized.pth")
+        self.extractor.load_state_dict(torch.load(pretrained_path, map_location=self.device))
 
-        # Freeze encoder (by default, no fine-tuning)
-        for name, param in self.encoder.named_parameters():
+        # Freeze extractor (by default, no fine-tuning)
+        for name, param in self.extractor.named_parameters():
             param.requires_grad = False
         """
         # Fine-tuning
@@ -311,16 +311,16 @@ class TemporalBranchTrainer_BC(BaseTrainer):
             'ConvBlock6',       # Fast stream's last conv (selective)
             'ConvBlock3'        # stem's last conv (selective)
         ]
-        for name, param in self.encoder.module.named_parameters():
+        for name, param in self.extractor.module.named_parameters():
             if any(key in name for key in modules_to_finetune):
                 param.requires_grad = True
             else:
                 param.requires_grad = False
         """
 
-        # ------------------------------ Temporal Decoder ------------------------------
+        # ---------------- MTDE (Multi-scale Temporal Dynamics Encoder) ----------------
         """Multi-scale 1D CNN + SE blocks for extracting temporal features from rPPG"""
-        self.temporal_branch = TemporalBranch(
+        self.mtde = MTDE(
             embedding_dim=config.MODEL.EMOTION.TEMPORAL_EMBED_DIM
         ).to(self.device)
 
@@ -360,10 +360,10 @@ class TemporalBranchTrainer_BC(BaseTrainer):
 
         # ----------------------------- Chunk Forward Module ----------------------------
         self.chunk_forward_module = ChunkForwardModule(
-            encoder=self.encoder.module,
-            temporal_branch=self.temporal_branch,
+            extractor=self.extractor.module,
+            encoder=self.mtde,
             use_checkpoint=False,
-            freeze_encoder=True
+            freeze_extractor=True
         ).to(self.device)
 
         # -------------------------------- Loss Functions -------------------------------
@@ -471,7 +471,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
             self.temperature        = 1.0                                               # fixed
         
         # ───────────────────── Phase-2 ─────────────────────
-        elif epoch > PHASE_BOUND[1]:                          
+        elif epoch >= PHASE_BOUND[1]:                          
             phase, lr, wd, t_max    = 2, 1e-4, 5e-5, 25                                 # (= 15 × 1.0)
             self.lambda_ent         = 0.0
             self.contrastive_weight = 0.0
@@ -483,7 +483,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
         # ─────── Gradient gate ───────
         for p in self.attn_scorer.parameters():
             p.requires_grad = True
-        for p in self.temporal_branch.parameters():
+        for p in self.mtde.parameters():
             p.requires_grad = True
         for p in self.chunk_projection.parameters():
             p.requires_grad = (phase == 0)
@@ -530,7 +530,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
 
         # --------- params setup ---------
         modules = [
-            (self.temporal_branch,     lr_raw),
+            (self.mtde,                lr_raw),
             (self.attn_scorer,         lr_as),
             (self.pooling,             lr_raw),
             (self.chunk_projection,    lr_raw),
@@ -569,7 +569,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
         - Phase 2: Session-level CE with GatedPooling
         
         Handles:
-        - TemporalBranch → chunk-wise rPPG embeddings
+        - MTDE(encoder) → chunk-wise rPPG embeddings
         - AttnScorer: pre-softmax raw score
         - SupConLossTopK with Top-K + threshold selection from epoch ≥ 20
         - GatedPooling for CE loss
@@ -824,7 +824,7 @@ class TemporalBranchTrainer_BC(BaseTrainer):
         
         Main training loop for session-level emotion classification using:
         🔁 Pipeline:
-        - TemporalBranch extracts chunk-wise rPPG embeddings
+        - MTDE(encoder) extracts chunk-wise rPPG embeddings
         - AttnScorer assigns attention scores (softmax → entmax → raw score)
         - Top-K + threshold selection for contrastive learning (SupConLossTopK)
         - GatedPooling aggregates session embeddings (used for CE)
@@ -925,8 +925,8 @@ class TemporalBranchTrainer_BC(BaseTrainer):
                 # === GRADIENT CHECK ===
                 if idx % 20 == 0:
                     modules = [
-                        # ("Encoder", self.encoder),
-                        ("Temporal", self.temporal_branch),
+                        # ("Extractor", self.extractor),
+                        ("MTDE", self.mtde),
                         ("AttentionScorer", self.attn_scorer),
                         ("Projection", self.chunk_projection),
                         ("ChunkAuxClassifier", self.chunk_aux_classifier),
@@ -1199,12 +1199,12 @@ class TemporalBranchTrainer_BC(BaseTrainer):
 
         # === Save all modules ===
         model_dict = {
-            "temporal_branch": self.temporal_branch.state_dict(),
-            "attn_scorer": self.attn_scorer.state_dict(),
-            "projection_head": self.chunk_projection.state_dict(),
-            "chunk_aux_classifier": self.chunk_aux_classifier.state_dict(),
-            "gated_pooling": self.pooling.state_dict(),
-            "classifier": self.classifier.state_dict(),
+            "mtde"                  : self.mtde.state_dict(),
+            "attn_scorer"           : self.attn_scorer.state_dict(),
+            "projection_head"       : self.chunk_projection.state_dict(),
+            "chunk_aux_classifier"  : self.chunk_aux_classifier.state_dict(),
+            "gated_pooling"         : self.pooling.state_dict(),
+            "classifier"            : self.classifier.state_dict(),
         }
         model_path = os.path.join(model_save_dir, f"{base_name}_{tag}.pth")
         torch.save(model_dict, model_path)
@@ -1236,12 +1236,12 @@ class TemporalBranchTrainer_BC(BaseTrainer):
     def load_best_model(self, path):
         """
         Load the best model weights from a saved checkpoint.
-        This includes TemporalBranch, AttentionScorer, ChunkProjection, 
+        This includes MTDE(encoder), AttentionScorer, ChunkProjection, 
         ChunkAuxClassifier, GatedPooling, and Classifier.
         """
         checkpoint = torch.load(path, map_location=self.device)
         
-        self.temporal_branch.load_state_dict(checkpoint["temporal_branch"])
+        self.mtde.load_state_dict(checkpoint["mtde"])
         self.attn_scorer.load_state_dict(checkpoint["attn_scorer"])
         self.chunk_projection.load_state_dict(checkpoint["projection_head"])
         self.chunk_aux_classifier.load_state_dict(checkpoint["chunk_aux_classifier"])
@@ -1278,8 +1278,8 @@ class TemporalBranchTrainer_BC(BaseTrainer):
             print(f"[PLOT] Saved: {path}")
 
     def train_mode(self):
-        # self.encoder.train()
-        self.temporal_branch.train()
+        # self.extractor.train()
+        self.mtde.train()
         self.attn_scorer.train()
         self.chunk_projection.train()
         self.chunk_aux_classifier.train()
@@ -1287,8 +1287,8 @@ class TemporalBranchTrainer_BC(BaseTrainer):
         self.classifier.train()
 
     def eval_mode(self):
-        # self.encoder.eval()
-        self.temporal_branch.eval()
+        # self.extractor.eval()
+        self.mtde.eval()
         self.attn_scorer.eval()
         self.chunk_projection.eval()
         self.chunk_aux_classifier.eval()

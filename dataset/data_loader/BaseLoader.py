@@ -13,8 +13,8 @@ import re
 from math import ceil
 from scipy import signal
 from scipy import sparse
-from unsupervised_encoders.methods import POS_WANG
-from unsupervised_encoders import utils
+from unsupervised_extractors.methods import POS_WANG
+from unsupervised_extractors import utils
 import math
 from multiprocessing import Pool, Process, Value, Array, Manager
 

@@ -4,7 +4,7 @@ DEVICE: cuda:0
 ENCODER:
   DROP_RATE: 0.0
   MODEL_DIR: PreTrainedModels
-  NAME: TemporalBranch
+  NAME: MTDE
   RESUME: ''
 INFERENCE:
   BATCH_SIZE: 1
@@ -90,8 +90,8 @@ RESULTS:
       BgAAAAAAAAAWAAAAAAAAAAMAAAAAAAAAFgAAAAAAAAA=
   f1_score: 0.6376811594202899
   tag: best_metric_phase0
-  train_loss: 0.8771839535461282
-  valid_loss: 0.6825156183737628
+  train_loss: 0.876684511607548
+  valid_loss: 0.6822231400687739
 ReMOTION_MODE: train_and_test
 TEST:
   BATCH_SIZE: 1

@@ -1,1 +1,1 @@
-import trainer.TemporalBranchTrainer_BC
+import trainer.MTDETrainer_BC

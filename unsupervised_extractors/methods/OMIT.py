@@ -6,7 +6,7 @@ IEEE Journal of Biomedical and Health Informatics.
 """
 
 import numpy as np
-from unsupervised_encoders import utils
+from unsupervised_extractors import utils
 
 
 def OMIT(frames):

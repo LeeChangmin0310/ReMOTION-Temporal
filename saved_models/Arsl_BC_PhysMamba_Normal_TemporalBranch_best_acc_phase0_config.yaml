@@ -4,7 +4,7 @@ DEVICE: cuda:0
 ENCODER:
   DROP_RATE: 0.0
   MODEL_DIR: PreTrainedModels
-  NAME: TemporalBranch
+  NAME: MTDE
   RESUME: ''
 INFERENCE:
   BATCH_SIZE: 1
@@ -57,7 +57,7 @@ MODEL:
     FRAME_NUM: 160
 NUM_OF_GPU_TRAIN: 1
 RESULTS:
-  accuracy: 0.5660377358490566
+  accuracy: 0.5471698113207547
   best_epoch: 2
   confusion_matrix: !!python/object/apply:numpy.core.multiarray._reconstruct
     args:
@@ -87,11 +87,11 @@ RESULTS:
       - 0
     - false
     - !!binary |
-      DwAAAAAAAAANAAAAAAAAAAoAAAAAAAAADwAAAAAAAAA=
-  f1_score: 0.5660377358490566
+      CgAAAAAAAAASAAAAAAAAAAYAAAAAAAAAEwAAAAAAAAA=
+  f1_score: 0.6129032258064517
   tag: best_acc_phase0
-  train_loss: 0.6906813731733358
-  valid_loss: 0.673918198864415
+  train_loss: 0.6857391876994439
+  valid_loss: 0.6879190302120065
 ReMOTION_MODE: train_and_test
 TEST:
   BATCH_SIZE: 1

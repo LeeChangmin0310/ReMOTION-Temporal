@@ -1,5 +1,6 @@
 # =============================================
-# TemporalBranch_v10: Multi-Scale Temporal Feature Extraction(16, 24, 32) using CNN + WeightedTemporalPooling
+# MTDEv10: Multi-Scale Temporal Feature Extraction(16, 24, 32) using CNN + WeightedTemporalPooling
+# Multi-scale Temporal Encoder
 # --------------------------------------------------------------
 # Purpose:
 #   - Extract rich and discriminative temporal features from rPPG signals.
@@ -71,9 +72,9 @@ class MultiScaleTemporalBlock(nn.Module):
         return x
 
 
-class TemporalBranch(nn.Module):
+class MTDE(nn.Module):
     def __init__(self, in_channels=1, cnn_out_channels=24, embedding_dim=256, dropout_rate=0.1):
-        super(TemporalBranch, self).__init__()
+        super(MTDE, self).__init__()
 
         # Initial convolutional layer to extract local temporal patterns
         self.stem = nn.Sequential(
