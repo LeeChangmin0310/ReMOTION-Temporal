@@ -1,6 +1,128 @@
 # =============================================
+# MTDEv11: Optimized Multi-Scale Temporal Dynamics Encoder
+# =============================================
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class WeightedTemporalPooling(nn.Module):
+    """
+    Learnable weighted pooling over temporal dimension.
+    Allows the model to softly attend to important time steps.
+    """
+    def __init__(self, input_dim):
+        super().__init__()
+        self.attn = nn.Sequential(
+            # 1x1 conv to compute attention score per time step
+            nn.Conv1d(input_dim, 1, kernel_size=1),
+            nn.Softmax(dim=-1)
+        )
+
+    def forward(self, x):  # x: (B, C, T)
+        attn = self.attn(x)       # (B, 1, T)
+        return torch.sum(x * attn, dim=-1)  # (B, C)
+
+
+class MultiScaleTemporalBlock(nn.Module):
+    """
+    Multi-scale temporal encoder that captures
+      • short RF ≈ 3 frames
+      • medium RF ≈  (3−1)*4+1 = 9 frames
+      • long   RF ≈ (3−1)*16+1 = 33 frames
+    using dilation and varied kernel sizes.
+    """
+    def __init__(self, in_channels=24, embedding_dim=256, dropout_rate=0.2):
+        super().__init__()
+        # Branch for short-range patterns (kernel=3)
+        self.branch_short = nn.Sequential(
+            nn.Conv1d(in_channels, 16, kernel_size=3, padding=1, dilation=1),
+            nn.GELU(),
+            nn.MaxPool1d(2)
+        )
+        # Branch for medium-range patterns (kernel=5)
+        self.branch_med = nn.Sequential(
+            nn.Conv1d(in_channels, 24, kernel_size=5, padding=2, dilation=1),
+            nn.GELU(),
+            nn.MaxPool1d(2)
+        )
+        # Branch for long-range patterns (kernel=3, dilation=4)
+        self.branch_long = nn.Sequential(
+            nn.Conv1d(in_channels, 32, kernel_size=3, padding=4, dilation=4),
+            nn.GELU(),
+            nn.MaxPool1d(2)
+        )
+
+        # combine branch outputs: total channels = 16+24+32 = 72
+        self.norm = nn.GroupNorm(num_groups=8, num_channels=72)
+        self.dropout = nn.Dropout(dropout_rate)
+        self.pool = WeightedTemporalPooling(input_dim=72)
+        self.fc = nn.Linear(72, embedding_dim)
+
+    def forward(self, x):  # x: (B, C, T)
+        out_s = self.branch_short(x)
+        out_m = self.branch_med(x)
+        out_l = self.branch_long(x)
+        x = torch.cat([out_s, out_m, out_l], dim=1)  # (B, 72, T')
+        x = self.norm(x)
+        x = self.dropout(x)
+        x = self.pool(x)  # (B, 72)
+        x = self.fc(x)    # (B, embedding_dim)
+        return F.gelu(x)
+
+
+class MTDE(nn.Module):
+    def __init__(self, in_channels=1, cnn_out_channels=24, embedding_dim=256, dropout_rate=0.1):
+        super().__init__()
+        # --------------------------------------------
+        # Stem: two convolutional layers + downsampling
+        # --------------------------------------------
+        self.stem = nn.Sequential(
+            # wider receptive field to capture pulse upswing
+            nn.Conv1d(in_channels, cnn_out_channels, kernel_size=7, padding=3),
+            nn.GroupNorm(num_groups=max(1, cnn_out_channels//4), num_channels=cnn_out_channels),
+            nn.GELU(),
+            # additional conv for deeper local features
+            nn.Conv1d(cnn_out_channels, cnn_out_channels, kernel_size=5, padding=2),
+            nn.GroupNorm(num_groups=max(1, cnn_out_channels//4), num_channels=cnn_out_channels),
+            nn.GELU(),
+            # stride conv for downsampling instead of maxpool
+            nn.Conv1d(cnn_out_channels, cnn_out_channels, kernel_size=3, padding=1, stride=2),
+            nn.Dropout(dropout_rate)
+        )
+
+        # Multi-scale temporal block for mid/long-range patterns
+        self.multi_scale_block = MultiScaleTemporalBlock(
+            in_channels=cnn_out_channels,
+            embedding_dim=embedding_dim,
+            dropout_rate=dropout_rate
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, (nn.Conv1d, nn.Linear)):
+                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, x):  # x: (B, T, 1)
+        # reshape to (B, C, T)
+        if x.dim() == 2:
+            x = x.unsqueeze(1)
+        elif x.shape[2] == 1:
+            x = x.transpose(1, 2)
+        # local feature extraction + downsampling
+        x_cnn = self.stem(x)
+        # multi-scale temporal encoding
+        emb = self.multi_scale_block(x_cnn)
+        return emb
+
+'''
+# =============================================
 # MTDEv10: Multi-Scale Temporal Feature Extraction(16, 24, 32) using CNN + WeightedTemporalPooling
-# Multi-scale Temporal Encoder
+# Multi-scale Temporal Dynamics Encoder
 # --------------------------------------------------------------
 # Purpose:
 #   - Extract rich and discriminative temporal features from rPPG signals.
@@ -110,6 +232,7 @@ class MTDE(nn.Module):
         x_cnn = self.stem(x)
         emb = self.multi_scale_block(x_cnn)  # (B, embedding_dim)
         return emb
+'''
 
 '''
 # =============================================
