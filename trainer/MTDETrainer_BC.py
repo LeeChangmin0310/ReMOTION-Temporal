@@ -289,7 +289,7 @@ class MTDETrainer_BC(BaseTrainer):
         
         wandb.init(
             project="TemporalReMOTION",
-            name=f"Exp_Arsl_FINALCushionSpasity",
+            name=f"Exp_Arsl_FINALCushionGrad",
             # config=cfg_dict,
             dir="./wandb_logs"
         )
@@ -498,7 +498,7 @@ class MTDETrainer_BC(BaseTrainer):
         
         # ───────────────────── Phase-2 ─────────────────────
         elif epoch >= PHASE_BOUND[1]:                          
-            phase, lr, wd, t_max    = 2, 1e-4, 1e-3, 20                                 # (= 15 × 1.0)
+            phase, lr, wd, t_max    = 2, 1e-4, 1e-5, 20                                 # (= 15 × 1.0)
             self.lambda_ent         = 0.0
             self.contrastive_weight = 0.0
             self.chunk_ce_weight    = 0.0
@@ -542,7 +542,7 @@ class MTDETrainer_BC(BaseTrainer):
         * phase 2 : AttnScorer LR = 0.50 × lr   (fine-tuning)
         """
         # ------------------------------------------------------------------
-        lr_scale_as = 1.0 if phase == 0 else (2.0 if phase == 1 else 0.5)
+        lr_scale_as = 1.0 if phase < 2 else 0.5
         lr_raw      = lr                     # default lr per phase
         lr_as       = lr * lr_scale_as       # lr for AttnScorer
         # ------------------------------------------------------------------
@@ -693,8 +693,10 @@ class MTDETrainer_BC(BaseTrainer):
                 with torch.no_grad():
                     _ = self.chunk_projection(chunk_emb)
                 
-                # gated embedding (forward hard, backward soft)
-                gated_emb = chunk_emb * alpha_mask.unsqueeze(-1)                                        # (1,T,D)
+                # gated embedding (forward hard, backward soft)                                            
+                gated_emb_hard = chunk_emb * alpha_mask.unsqueeze(-1)                                   # (1,T,D)
+                gated_emb_soft = chunk_emb * attn_soft                                                  # (1,T,D)
+                gated_emb = gated_emb_hard + (gated_emb_soft - gated_emb_soft.detach())                 # (1,T,D)
                 
                 # Top-K chunk-level logits & per-chunk loss
                 logits_all   = self.chunk_aux_classifier(gated_emb.squeeze(0))                          # (T,C)
@@ -702,7 +704,7 @@ class MTDETrainer_BC(BaseTrainer):
                 ce_per_chunk = self.aux_criterion(logits_all, lbl_all)                                  # scalar
                 
                 # weighted sum → scalar chunk CE (backward soft)
-                alpha_prob = alpha_mask.squeeze(0)                                                      # (T,)
+                alpha_prob = attn_soft.squeeze(0)                                                      # (T,)
                 weighted_ce  = (alpha_prob * ce_per_chunk).sum() / (alpha_prob.sum() + 1e-8)            # ← eps
                 chunk_ce_losses.append(weighted_ce)
             

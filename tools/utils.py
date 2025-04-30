@@ -152,8 +152,7 @@ class FocalLoss(nn.Module):
     def forward(self, logits: torch.Tensor,
                 targets: torch.Tensor) -> torch.Tensor:
         # CE per-sample
-        ce_loss = F.cross_entropy(logits, targets,
-                                  reduction="none", label_smoothing=0.0)
+        ce_loss = F.cross_entropy(logits, targets, reduction="none", label_smoothing=0.0)
         # Convert to probability of correct class
         pt = torch.exp(-ce_loss)
         focal = self.alpha * (1. - pt) ** self.gamma * ce_loss
