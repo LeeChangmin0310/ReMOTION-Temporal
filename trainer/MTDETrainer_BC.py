@@ -208,6 +208,7 @@ import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 
 from tqdm import tqdm
+from copy import deepcopy
 from functools import partial
 from torch.utils.data import DataLoader
 from sklearn.metrics import accuracy_score, confusion_matrix, f1_score
@@ -227,7 +228,7 @@ from modules.ChunkAuxClassifier import ChunkAuxClassifier
 from tools.utils import SupConLossTopK, FocalLoss
 from tools.utils import reconstruct_sessions, run_tsne_and_plot, straight_through_topk
 
-PHASE_BOUND = [15, 25]
+PHASE_BOUND = [15, 30]
 
 class MTDETrainer_BC(BaseTrainer):
     """
@@ -288,7 +289,7 @@ class MTDETrainer_BC(BaseTrainer):
         
         wandb.init(
             project="TemporalReMOTION",
-            name=f"Exp_Arsl_FINAL_MTDE",
+            name=f"Exp_Arsl_FINALCushionSpasity",
             # config=cfg_dict,
             dir="./wandb_logs"
         )
@@ -338,8 +339,8 @@ class MTDETrainer_BC(BaseTrainer):
         
         # ------------------------------ Chunk Auxiliary Classifier -------------------------
         """Auxiliary classifier for weak chunk-level CE loss.
-        Trained with session-level GT label per chunk."""
-        self.chunk_aux_classifier = ChunkAuxClassifier(
+        Trained with session-level GT label per chunk and same structure with ClassificationHead"""
+        self.chunk_aux_classifier = ClassificationHead( # ChunkAuxClassifier(
             input_dim=config.MODEL.EMOTION.TEMPORAL_EMBED_DIM,
             num_classes=config.TRAIN.NUM_CLASSES
         ).to(self.device)
@@ -436,10 +437,11 @@ class MTDETrainer_BC(BaseTrainer):
         - Sets loss weights, temperature, top-k ratio
         - Controls gradient flow
         - Configures optimizer/scheduler
-        
-        Phase 0 (0–14): SupCon + Entropy Temperature Control
-        Phase 1 (15–24): Chunk CE + Top-K
-        Phase 2 (25–49): Final CE + Classifier + GatedPooling
+        Phase0 (0–14): SupCon + Entropy temp control
+        Phase1a (15–19): Chunk CE ramp-up + Top-K high
+        Phase1b (20–24): Chunk CE max + Top-K low
+        Phase1c (25–29): Chunk CE max + Session CE ramp-up
+        Phase2 (30–49): Session CE only + GatedPooling
         """
         
         # ───────────────────── Phase-0 ─────────────────────
@@ -461,24 +463,52 @@ class MTDETrainer_BC(BaseTrainer):
         
         # ───────────────────── Phase-1 ─────────────────────
         elif PHASE_BOUND[0] <= epoch < PHASE_BOUND[1]:        
-            phase, lr, wd, t_max    = 1, 2e-4, 5e-5, 10                                 # (= 15 × 1.3 ≈ 20)
-            
-            self.contrastive_weight = 0.0                                               # Weak SupCon
+            phase = 1
+            sub = epoch - PHASE_BOUND[0]  # 0…14
+
+            # Base lr/wd/t_max for Phase1
+            lr, wd, t_max = 2e-4, 5e-4, 15
+            self.contrastive_weight = 0.0
             self.lambda_ent         = 0.0
-            self.chunk_ce_weight    = min(1.0, 0.5 + 0.05 * (epoch - PHASE_BOUND[0]))   # λ_chunk : 0.5 → 1.0 (10 epoch)
-            self.top_k_ratio        = max(0.3, 0.6 - 0.03*(epoch - PHASE_BOUND[0]))     # Top-k ratio: 0.6 → 0.3 (linearly)
+            self.chunk_ce_weight    = 0.0
+            self.top_k_ratio        = 0.0
             self.ce_weight          = 0.0
-            self.temperature        = 1.0                                               # fixed
+            self.temperature        = 1.0
+
+            # ─── Phase1a ─── epochs 15–19 ───
+            if sub < 5:
+                # chunk CE: 0.5→1.0 over 5 epochs
+                self.chunk_ce_weight = 0.5 + sub * (0.5/5)
+                # Top-K: 0.6→0.5
+                self.top_k_ratio     = 0.6 - sub * (0.1/5)
+                self.ce_weight       = 0.0
+
+            # ─── Phase1b ─── epochs 20–24 ───
+            elif sub < 10:
+                self.chunk_ce_weight = 1.0
+                # Top-K: 0.5→0.3 over next 5 epochs
+                self.top_k_ratio     = 0.5 - (sub-5) * (0.2/5)
+                self.ce_weight       = 0.0
+
+            # ─── Phase1c ─── epochs 25–29 ───
+            else:
+                self.chunk_ce_weight = 1.0
+                self.top_k_ratio     = 0.3
+                self.ce_weight       = (sub-10) * (0.5/5)                               # 0 → 0.5 over 5 epochs (cushion)
         
         # ───────────────────── Phase-2 ─────────────────────
         elif epoch >= PHASE_BOUND[1]:                          
-            phase, lr, wd, t_max    = 2, 1e-4, 5e-5, 25                                 # (= 15 × 1.0)
+            phase, lr, wd, t_max    = 2, 1e-4, 1e-3, 20                                 # (= 15 × 1.0)
             self.lambda_ent         = 0.0
             self.contrastive_weight = 0.0
             self.chunk_ce_weight    = 0.0
             self.top_k_ratio        = 0.0
             self.ce_weight          = min(1.0, 0.5 + 0.02 * (epoch - PHASE_BOUND[1]))   # 0.5 → 1.0
             self.temperature        = 1.0
+            
+            # copy chunk_aux → session-level classifier
+            if epoch == PHASE_BOUND[1]:
+                self.classifier = deepcopy(self.chunk_aux_classifier)
             
         # ─────── Gradient gate ───────
         for p in self.attn_scorer.parameters():
@@ -490,7 +520,7 @@ class MTDETrainer_BC(BaseTrainer):
         for p in self.chunk_aux_classifier.parameters():
             p.requires_grad = (phase == 1)
         for p in self.pooling.parameters():
-            p.requires_grad = (phase == 2)
+            p.requires_grad = (phase == 2) or (phase == 1 and epoch - PHASE_BOUND[0] >= 10)
         for p in self.classifier.parameters():
             p.requires_grad = (phase == 2)
 
@@ -549,10 +579,8 @@ class MTDETrainer_BC(BaseTrainer):
 
         # --------- Optimizer / Scheduler ---------
         self.optimizer = optim.AdamW(pg_decay + pg_nodecay)
-        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, T_max=t_max, eta_min=1e-6
-        )
-        # self.scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(self.optimizer, T_0=10, T_mult=2, eta_min=1e-6)
+        self.scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(self.optimizer, T_0=t_max, T_mult=2, eta_min=1e-6)
+        # self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=t_max, eta_min=1e-6)
         return frozen
     
     # ----------------------------------------------------------
@@ -636,7 +664,9 @@ class MTDETrainer_BC(BaseTrainer):
                 labels_for_supcon.append(torch.full((T,), label, dtype=torch.long, device=self.device))
             
             # ─── Phase 1: Chunk-CE with ST-TopK ─────────────────
+            # phase1-a,b,c
             elif phase == 1:
+                sub = epoch - PHASE_BOUND[0]                                              
                 # just in case
                 if len(raw_scaled.squeeze(0).squeeze(-1)) < 1:
                     print("Empty attention scores – skip this session")
@@ -659,10 +689,9 @@ class MTDETrainer_BC(BaseTrainer):
                 entropy_attn_soft = -(attn_soft * attn_soft.clamp_min(1e-8).log()).sum(dim=1).mean()
                 
                 # ChunkAuxClassifier & Focal CE ―― only this block tracked
+                # projection -> no_grad in phase1-a,b,c
                 with torch.no_grad():
-                    # projection, pooling -> no_grad
                     _ = self.chunk_projection(chunk_emb)
-                    _ = self.pooling(chunk_emb, raw_scaled)
                 
                 # gated embedding (forward hard, backward soft)
                 gated_emb = chunk_emb * alpha_mask.unsqueeze(-1)                                        # (1,T,D)
@@ -673,12 +702,12 @@ class MTDETrainer_BC(BaseTrainer):
                 ce_per_chunk = self.aux_criterion(logits_all, lbl_all)                                  # scalar
                 
                 # weighted sum → scalar chunk CE (backward soft)
-                alpha_prob = alpha_mask.squeeze(0)                                                   # (T,)
+                alpha_prob = alpha_mask.squeeze(0)                                                      # (T,)
                 weighted_ce  = (alpha_prob * ce_per_chunk).sum() / (alpha_prob.sum() + 1e-8)            # ← eps
                 chunk_ce_losses.append(weighted_ce)
             
             # ─── Phase 2: GatedPooling + Session-CE ───────────────
-            else:              
+            else:
                 alpha = torch.ones_like(raw_scaled)                                                     # (1,T,1)
                 entropy_attn_soft = 0
                 
@@ -687,10 +716,9 @@ class MTDETrainer_BC(BaseTrainer):
                     _ = self.chunk_projection(chunk_emb)
                     _ = self.chunk_aux_classifier(chunk_emb.squeeze(0))
 
-
             # 3) session-level pooling
             pooled, attn_gated, ent_gated = self.pooling(
-                chunk_emb, raw_scaled, return_weights=True, return_entropy=True)
+                chunk_emb, raw_scaled, epoch, return_weights=True, return_entropy=True)
             
             # ★──────── session-level t-SNE ───────────────────
             sess_emb = pooled.squeeze(0)                              # (D,)
@@ -755,7 +783,11 @@ class MTDETrainer_BC(BaseTrainer):
                 return None
             loss_total = contrastive_term_scaled + self.lambda_ent * sparsity_loss
         elif phase == 1:
-            loss_total = chunk_ce_loss_scaled
+            sub = epoch - PHASE_BOUND[0]
+            if sub < 10:                                            # Phase1-a,b
+                loss_total = chunk_ce_loss_scaled
+            else:                                                   # Phase1-c (Cushion)
+                loss_total = chunk_ce_loss_scaled + ce_loss_scaled 
         else:                             
             loss_total = ce_loss_scaled
         # ----------------------------------------------------

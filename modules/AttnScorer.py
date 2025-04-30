@@ -68,16 +68,24 @@ class AttnScorer(nn.Module):
         alpha = None
         
         # --- choose attention kernel ----------------------
-        if epoch < 15:                                                      # Phase 0:  Softmax diversity explore
-            attn = torch.softmax(raw_scaled / temperature, dim=1)
+        if self.training:
+            if epoch < 15:                                                      # Phase 0:  Softmax diversity explore
+                attn = torch.softmax(raw_scaled / temperature, dim=1)
             
-        elif 15 <= epoch < 25:                                              # Phase 1:  α-Entmax discriminativity explore        
-            alpha = 1.8 - 0.02 * (epoch - 15)                                     # α: 1.8 → 1.6  (10 ep ×0.03) linearly over 10ep
-            attn = entmax.entmax_bisect(raw_scaled, alpha=alpha, dim=1)           # (B,T)
+            elif 15 <= epoch < 30:                                              # Phase 1:  α-Entmax discriminativity explore                   
+                if epoch < 20:                                                      # Phase-1a
+                    alpha = 1.0 + 0.3 * ((epoch - 15) / 5)                              # 1.0 → 1.3
+                elif epoch < 25:                                                    # Phase-1b
+                    alpha = 1.3 + 0.2 * ((epoch - 20) / 5)                              # 1.3 → 1.5
+                elif epoch < 30:                                                    # Phase-1c
+                    alpha = 1.5                                                         # 1.5
+                attn = entmax.entmax_bisect(raw_scaled, alpha=alpha, dim=1)         # (B,T)
+                
+            else:                                                               # Phase 2:    scorer fine-tune
+                attn  = None                                                          # use raw_scores only
+        else:
+            attn = entmax.entmax_bisect(raw_scaled, alpha=1.5, dim=1)
             
-        else:                                                               # Phase 2:    scorer fine-tune
-            attn  = None                                                          # use raw_scores only
-        
         # 4) DEBUG
         if self.training and (torch.rand(1).item() < 0.05):   # 5 % debug
             print(f"[AttnScorer] epoch={epoch:02d} | σ={sigma:.3f} "

@@ -60,7 +60,7 @@ def reconstruct_sessions(self, batch=None, idx=None, epoch=None, phase="train"):
             
         attn_np = attn_weights.detach().cpu().squeeze().numpy()
         if phase in ['train', 'valid']:
-            if epoch <= 34: # valid, phase0 and phase1
+            if epoch <= 30: # valid, phase0 and phase1
                 print(f"[DEBUG][AttnScorer Weights] {attn_np.tolist()}")
                 print(f"[DEBUG][AttnScorer Sparsity] mean={attn_np.mean():.4f}, std={attn_np.std():.4f}, entropy={entropy.item():.4f}")
         else: # test and phase 2

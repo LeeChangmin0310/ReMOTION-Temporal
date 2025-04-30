@@ -36,7 +36,7 @@ class GatedPooling(nn.Module):
             nn.Sigmoid()
         )
 
-    def forward(self, x, attn_scores, return_weights=False, return_entropy=False):
+    def forward(self, x, attn_scores, epoch=None, return_weights=False, return_entropy=False):
         """
         Forward pass for gated attention pooling.
 
@@ -53,12 +53,15 @@ class GatedPooling(nn.Module):
         """
         # attn_weights = entmax.entmax15(attn_scores, dim=1)  # (B, T, 1)
         # attn_weights = F.softmax(attn_scores, dim=1)  # (B, T, 1)
-        alpha_g = 1.2
-        attn_weights = entmax.entmax_bisect(attn_scores, alpha=alpha_g, dim=1)  # (B, T, 1)
+        if self.training:
+            alpha_g = 1.5 + 0.3 * min((epoch - 30) / 19, 1.0)                       # 1.5 → 1.8 over epochs 30→50
+        elif epoch == None or not self.training: 
+            alpha_g=1.8
+        attn_weights = entmax.entmax_bisect(attn_scores, alpha=alpha_g, dim=1)      # (B, T, 1)
 
-        gate = self.gate(x)                                                     # (B, T, D)
-        gated_x = x * gate                                                      # (B, T, D)
-        pooled = torch.sum(attn_weights * gated_x, dim=1)                       # (B, D)
+        gate = self.gate(x)                                                         # (B, T, D)
+        gated_x = x * gate                                                          # (B, T, D)
+        pooled = torch.sum(attn_weights * gated_x, dim=1)                           # (B, D)
 
         entropy = -torch.sum(attn_weights * torch.log(attn_weights + 1e-8), dim=1).mean()
 

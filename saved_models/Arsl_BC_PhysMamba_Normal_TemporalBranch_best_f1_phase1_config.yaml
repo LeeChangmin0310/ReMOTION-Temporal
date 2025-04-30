@@ -58,7 +58,7 @@ MODEL:
 NUM_OF_GPU_TRAIN: 1
 RESULTS:
   accuracy: 0.4716981132075472
-  best_epoch: 15
+  best_epoch: 27
   confusion_matrix: !!python/object/apply:numpy.core.multiarray._reconstruct
     args:
     - !!python/name:numpy.ndarray ''
@@ -90,8 +90,8 @@ RESULTS:
       AAAAAAAAAAAcAAAAAAAAAAAAAAAAAAAAGQAAAAAAAAA=
   f1_score: 0.641025641025641
   tag: best_f1_phase1
-  train_loss: 0.117038812136875
-  valid_loss: 1.0032787143059496
+  train_loss: 0.2604473868630967
+  valid_loss: 0.7457098606622444
 ReMOTION_MODE: train_and_test
 TEST:
   BATCH_SIZE: 1

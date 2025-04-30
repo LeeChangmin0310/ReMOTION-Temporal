@@ -89,7 +89,7 @@ LOG:
   PATH: /home/changmin/log
   # SAVE_PLOTS: True
 ENCODER:
-  NAME: TemporalBranch
+  NAME: MTDE
 INFERENCE:
   BATCH_SIZE: 1
   EVALUATION_METHOD: "FFT"        # "FFT" or "peak detection"
