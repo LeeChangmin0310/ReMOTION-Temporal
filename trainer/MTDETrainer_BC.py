@@ -289,7 +289,7 @@ class MTDETrainer_BC(BaseTrainer):
         
         wandb.init(
             project="TemporalReMOTION",
-            name=f"Exp_Arsl_FINALCushionGrad",
+            name=f"Exp_Vlnc",
             # config=cfg_dict,
             dir="./wandb_logs"
         )
@@ -498,7 +498,7 @@ class MTDETrainer_BC(BaseTrainer):
         
         # ───────────────────── Phase-2 ─────────────────────
         elif epoch >= PHASE_BOUND[1]:                          
-            phase, lr, wd, t_max    = 2, 1e-4, 1e-5, 20                                 # (= 15 × 1.0)
+            phase, lr, wd, t_max    = 2, 1e-4, 2e-4, 20                                 # (= 15 × 1.0)
             self.lambda_ent         = 0.0
             self.contrastive_weight = 0.0
             self.chunk_ce_weight    = 0.0
@@ -508,7 +508,7 @@ class MTDETrainer_BC(BaseTrainer):
             
             # copy chunk_aux → session-level classifier
             if epoch == PHASE_BOUND[1]:
-                self.classifier = deepcopy(self.chunk_aux_classifier)
+                self.classifier = deepcopy(self.chunk_aux_classifier.train())
             
         # ─────── Gradient gate ───────
         for p in self.attn_scorer.parameters():
