@@ -100,7 +100,13 @@ class ChunkForwardModule(nn.Module):
 
         # 2) Make rPPG a leaf tensor so TemporalBranch gradients flow
         rppg = rppg.requires_grad_(True)
-
+        #"""
+        # 3) Normalize rPPG
+        mean = rppg.mean(dim=1, keepdim=True)
+        std = rppg.std(dim=1, keepdim=True)
+        rppg_norm = (rppg - mean) / (std + 1e-6)
+        rppg_norm = rppg_norm.unsqueeze(-1)
+        #"""
         # 3) TemporalBranch (optionally checkpointed)
         if self.use_checkpoint:
             emb = checkpoint.checkpoint(self._temporal, rppg)

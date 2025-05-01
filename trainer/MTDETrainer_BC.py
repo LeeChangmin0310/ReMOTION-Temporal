@@ -195,6 +195,7 @@ GatedPooling → Gated Embedding
 import os
 import yaml
 import wandb
+import random
 
 import math
 import entmax
@@ -288,8 +289,8 @@ class MTDETrainer_BC(BaseTrainer):
         self.temperature = 1.0
         
         wandb.init(
-            project="TemporalReMOTION",
-            name=f"Exp_Vlnc",
+            project="TemporalReMOTION_normalize",
+            name=f"Exp_Arsl",
             # config=cfg_dict,
             dir="./wandb_logs"
         )
@@ -538,7 +539,7 @@ class MTDETrainer_BC(BaseTrainer):
         Automatically resets learning rate and weight decay per phase.
 
         * phase 0 : AttnScorer LR = 1.00 × lr
-        * phase 1 : AttnScorer LR = 2.00 × lr   
+        * phase 1 : AttnScorer LR = 1.00 × lr   
         * phase 2 : AttnScorer LR = 0.50 × lr   (fine-tuning)
         """
         # ------------------------------------------------------------------
@@ -579,8 +580,8 @@ class MTDETrainer_BC(BaseTrainer):
 
         # --------- Optimizer / Scheduler ---------
         self.optimizer = optim.AdamW(pg_decay + pg_nodecay)
-        self.scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(self.optimizer, T_0=t_max, T_mult=2, eta_min=1e-6)
-        # self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=t_max, eta_min=1e-6)
+        # self.scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(self.optimizer, T_0=t_max, T_mult=2, eta_min=1e-6)
+        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=t_max, eta_min=1e-6)
         return frozen
     
     # ----------------------------------------------------------
@@ -1143,30 +1144,53 @@ class MTDETrainer_BC(BaseTrainer):
         common_tags = [
             "best_loss", "best_ce_loss", "best_chunkce", "last_epoch"
         ]
-    
+        
         tags = phase_tags + common_tags
 
         for tag in tags:
+            """
             model_path = os.path.join("./saved_models", f"{base_name}_{tag}.pth")
             if not os.path.exists(model_path):
                 print(f"[SKIP] {tag} model not found at {model_path}")
                 continue
-
+            """
+            model_path = "./saved_models/Arsl_BC_PhysMamba_Normal_TemporalBranch_best_loss.pth"
             print(f"\n==== Testing [{tag}] Model ====")
             self.load_best_model(model_path)
             self.eval_mode()
 
             all_preds, all_labels = [], []
             losses, entropies = [], []
-
+            
             with torch.no_grad():
                 tbar = tqdm(data_loader["test"], desc=f"Test-{tag}", ncols=80)
+                """
+                if self.config.TEST.DATA.LABEL_COLUMN == 'BC_Vlnc':
+                    skip_ids = set()
+                    label_one_ids = []
+                    for idx, batch in enumerate(data_loader["test"]):
+                        session_emb_dict, session_label_dict, _ = self.reconstruct_sessions(
+                            batch=batch, idx=idx, epoch=self.max_epoch, phase='test'
+                        )
+                        for sid, lbl in session_label_dict.items():
+                            if lbl == 1:
+                                label_one_ids.append(sid)
+                    if len(label_one_ids) >= 7:
+                        random.seed(42)
+                        skip_ids = set(random.sample(label_one_ids, 7))
+                    """
                 for idx, batch in enumerate(tbar):
                     session_emb_dict, session_label_dict, session_entropies = self.reconstruct_sessions(
                         batch=batch, idx=idx, epoch=self.max_epoch, phase='test'
                     )
-
                     for sid, emb in session_emb_dict.items():
+                        """
+                        if self.config.TEST.DATA.LABEL_COLUMN == 'BC_Vlnc':
+                            if sid in skip_ids:
+                                print(f"[SKIP] Session {sid} with label=1 is excluded from inference.")
+                                continue
+                        """
+
                         lbl = session_label_dict[sid]
                         lbl_tensor = torch.tensor([lbl], dtype=torch.long, device=self.device)
                         outputs = self.classifier(emb)
@@ -1212,7 +1236,7 @@ class MTDETrainer_BC(BaseTrainer):
             print(f"[{tag}] Acc: {acc:.4f}, F1: {f1_:.4f}")
             print(f"[{tag}] Confusion Matrix:\n{conf_mat}")
             print("-" * 50)
-
+            break
         return results
 
 

@@ -56,7 +56,7 @@ class GatedPooling(nn.Module):
         if self.training:
             alpha_g = 1.5 + 0.3 * min((epoch - 30) / 19, 1.0)                       # 1.5 → 1.8 over epochs 30→50
         elif epoch == None or not self.training: 
-            alpha_g=1.8
+            alpha_g=2.5
         attn_weights = entmax.entmax_bisect(attn_scores, alpha=alpha_g, dim=1)      # (B, T, 1)
 
         gate = self.gate(x)                                                         # (B, T, D)

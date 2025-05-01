@@ -87,11 +87,11 @@ RESULTS:
       - 0
     - false
     - !!binary |
-      BAAAAAAAAAAYAAAAAAAAAAQAAAAAAAAAFQAAAAAAAAA=
-  f1_score: 0.6000000000000001
+      BwAAAAAAAAAVAAAAAAAAAAcAAAAAAAAAEgAAAAAAAAA=
+  f1_score: 0.5625
   tag: last_epoch
-  train_loss: 0.6073966009436913
-  valid_loss: 0.7023094369555419
+  train_loss: 0.6088998508903215
+  valid_loss: 0.6931052927700978
 ReMOTION_MODE: train_and_test
 TEST:
   BATCH_SIZE: 1
