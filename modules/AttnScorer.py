@@ -76,9 +76,9 @@ class AttnScorer(nn.Module):
                 if epoch < 20:                                                      # Phase-1a
                     alpha = 1.0 + 0.3 * ((epoch - 15) / 5)                              # 1.0 → 1.3
                 elif epoch < 25:                                                    # Phase-1b
-                    alpha = 1.3 + 0.2 * ((epoch - 20) / 5)                              # 1.3 → 1.5
+                    alpha = 1.3 + 0.3 * ((epoch - 20) / 5)                              # 1.3 → 1.6
                 elif epoch < 30:                                                    # Phase-1c
-                    alpha = 1.5                                                         # 1.5
+                    alpha = 1.7                                                         # 1.7
                 attn = entmax.entmax_bisect(raw_scaled, alpha=alpha, dim=1)         # (B,T)
                 
             else:                                                               # Phase 2:    scorer fine-tune
