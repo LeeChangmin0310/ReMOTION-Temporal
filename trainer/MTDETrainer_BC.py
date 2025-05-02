@@ -289,8 +289,8 @@ class MTDETrainer_BC(BaseTrainer):
         self.temperature = 1.0
         
         wandb.init(
-            project="TemporalReMOTION_normalize",
-            name=f"Exp_Arsl",
+            project="TemporalReMOTION_MTDEv12",
+            name=f"Exp_Vlnc",
             # config=cfg_dict,
             dir="./wandb_logs"
         )
@@ -1148,13 +1148,13 @@ class MTDETrainer_BC(BaseTrainer):
         tags = phase_tags + common_tags
 
         for tag in tags:
-            """
+            #"""
             model_path = os.path.join("./saved_models", f"{base_name}_{tag}.pth")
             if not os.path.exists(model_path):
                 print(f"[SKIP] {tag} model not found at {model_path}")
                 continue
-            """
-            model_path = "./saved_models/Arsl_BC_PhysMamba_Normal_TemporalBranch_best_loss.pth"
+            #"""
+            # model_path = "./saved_models/Arsl_BC_PhysMamba_Normal_TemporalBranch_best_loss.pth"
             print(f"\n==== Testing [{tag}] Model ====")
             self.load_best_model(model_path)
             self.eval_mode()
@@ -1236,7 +1236,7 @@ class MTDETrainer_BC(BaseTrainer):
             print(f"[{tag}] Acc: {acc:.4f}, F1: {f1_:.4f}")
             print(f"[{tag}] Confusion Matrix:\n{conf_mat}")
             print("-" * 50)
-            break
+            # break
         return results
 
 

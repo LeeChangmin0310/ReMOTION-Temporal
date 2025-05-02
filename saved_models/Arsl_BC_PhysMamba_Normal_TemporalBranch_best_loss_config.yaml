@@ -57,8 +57,8 @@ MODEL:
     FRAME_NUM: 160
 NUM_OF_GPU_TRAIN: 1
 RESULTS:
-  accuracy: 0.5471698113207547
-  best_epoch: 37
+  accuracy: 0.660377358490566
+  best_epoch: 44
   confusion_matrix: !!python/object/apply:numpy.core.multiarray._reconstruct
     args:
     - !!python/name:numpy.ndarray ''
@@ -87,11 +87,11 @@ RESULTS:
       - 0
     - false
     - !!binary |
-      BQAAAAAAAAAXAAAAAAAAAAEAAAAAAAAAGAAAAAAAAAA=
-  f1_score: 0.6666666666666666
+      FAAAAAAAAAAEAAAAAAAAAA4AAAAAAAAADwAAAAAAAAA=
+  f1_score: 0.625
   tag: best_loss
-  train_loss: 0.4385018185624536
-  valid_loss: 0.6907879563997377
+  train_loss: 0.4946478993262885
+  valid_loss: 0.6108348844748623
 ReMOTION_MODE: train_and_test
 TEST:
   BATCH_SIZE: 1
@@ -134,7 +134,7 @@ TEST:
       - ''
       SKIN_COLOR:
       - 1
-    LABEL_COLUMN: BC_Arsl
+    LABEL_COLUMN: BC_Vlnc
     LABEL_SOURCE: CSV
     NUM_FOLDS: 5
     PREPROCESS:
@@ -222,7 +222,7 @@ TRAIN:
       - ''
       SKIN_COLOR:
       - 1
-    LABEL_COLUMN: BC_Arsl
+    LABEL_COLUMN: BC_Vlnc
     LABEL_SOURCE: CSV
     NUM_FOLDS: 5
     PREPROCESS:
@@ -384,7 +384,7 @@ VALID:
       - ''
       SKIN_COLOR:
       - 1
-    LABEL_COLUMN: BC_Arsl
+    LABEL_COLUMN: BC_Vlnc
     LABEL_SOURCE: CSV
     NUM_FOLDS: 5
     PREPROCESS:

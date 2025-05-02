@@ -105,6 +105,7 @@ class ChunkForwardModule(nn.Module):
         mean = rppg.mean(dim=1, keepdim=True)
         std = rppg.std(dim=1, keepdim=True)
         rppg_norm = (rppg - mean) / (std + 1e-6)
+        # x_input = torch.stack([x_chunk_norm, x], dim=1)
         rppg_norm = rppg_norm.unsqueeze(-1)
         #"""
         # 3) TemporalBranch (optionally checkpointed)

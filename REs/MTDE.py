@@ -1,4 +1,180 @@
 # =============================================
+# MTDEv12: Optimized Multi-Scale Temporal Dynamics Encoder
+# =============================================
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+
+class WeightedTemporalPooling(nn.Module):
+    """
+    Learnable weighted pooling over the temporal dimension.
+    Computes attention scores per time step via a 1x1 convolution,
+    applies softmax across time, and returns the weighted sum.
+    Input: x of shape (B, C, T)
+    Output: Tensor of shape (B, C)
+    """
+    def __init__(self, input_dim: int):
+        super().__init__()
+        self.attn = nn.Sequential(
+            # 1x1 conv reduces channel dim to 1 for score computation
+            nn.Conv1d(input_dim, 1, kernel_size=1),
+            # softmax over temporal dimension
+            nn.Softmax(dim=-1)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, C, T)
+        attn_weights = self.attn(x)         # (B, 1, T)
+        # weighted sum over time → (B, C)
+        return torch.sum(x * attn_weights, dim=-1)
+
+
+class MultiScaleTemporalBlock(nn.Module):
+    """
+    Multi-scale temporal encoder that captures patterns at three scales:
+      • Short (~0.2 s → ~6 frames at 30fps)
+      • Medium (~1.3 s → ~38 frames)
+      • Long (~4.1 s → ~122 frames)
+    Utilizes small kernels with increasing dilation factors,
+    followed by MaxPool to reduce temporal length by half.
+    Input to each branch: (B, in_channels, T')
+    Output: pooled embedding of shape (B, embedding_dim)
+    """
+    def __init__(self, in_channels: int = 24,
+                 embedding_dim: int = 256,
+                 dropout_rate: float = 0.2):
+        super().__init__()
+        # Short-range branch: kernel=3, dilation=1 → RF₀≈6 frames
+        self.branch_short = nn.Sequential(
+            nn.Conv1d(in_channels, 16,
+                      kernel_size=3,
+                      dilation=1,
+                      padding=1),
+            nn.GELU(),
+            # halve temporal dimension
+            nn.MaxPool1d(kernel_size=2)
+        )
+
+        # Medium-range branch: kernel=3, dilation=9 → RF₀≈38 frames
+        self.branch_med = nn.Sequential(
+            nn.Conv1d(in_channels, 24,
+                      kernel_size=3,
+                      dilation=9,
+                      padding=9),
+            nn.GELU(),
+            nn.MaxPool1d(kernel_size=2)
+        )
+
+        # Long-range branch: kernel=3, dilation=30 → RF₀≈122 frames
+        self.branch_long = nn.Sequential(
+            nn.Conv1d(in_channels, 32,
+                      kernel_size=3,
+                      dilation=30,
+                      padding=30),
+            nn.GELU(),
+            nn.MaxPool1d(kernel_size=2)
+        )
+
+        # Combine branch outputs: total channels = 16 + 24 + 32 = 72
+        self.norm = nn.GroupNorm(num_groups=8, num_channels=72)
+        self.dropout = nn.Dropout(dropout_rate)
+        self.pool = WeightedTemporalPooling(input_dim=72)
+        # Final linear projection to embedding_dim
+        self.fc = nn.Linear(72, embedding_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, C, T') from previous downsampling
+        out_s = self.branch_short(x)   # (B, 16, T" )
+        out_m = self.branch_med(x)     # (B, 24, T" )
+        out_l = self.branch_long(x)    # (B, 32, T" )
+        # Concatenate along channel dim → (B, 72, T" )
+        cat = torch.cat([out_s, out_m, out_l], dim=1)
+        # Normalize + dropout
+        cat = self.norm(cat)
+        cat = self.dropout(cat)
+        # Weighted temporal pooling → (B, 72)
+        pooled = self.pool(cat)
+        # Final embedding → (B, embedding_dim)
+        emb = self.fc(pooled)
+        return F.gelu(emb)
+
+
+class MTDE(nn.Module):
+    """
+    Multi-Temporal Dynamics Encoder (MTDE) for rPPG-based emotion recognition.
+    - Stem: two Conv1d layers + stride-2 downsampling → reduces T by half
+    - MultiScaleTemporalBlock: captures multi-scale temporal features
+    Output: session-level embedding of size embedding_dim
+    """
+    def __init__(self,
+                 in_channels: int = 1,
+                 cnn_out_channels: int = 24,
+                 embedding_dim: int = 256,
+                 dropout_rate: float = 0.1):
+        super().__init__()
+        # ------------------------------------------
+        # Stem: local feature extraction + downsampling
+        # ------------------------------------------
+        self.stem = nn.Sequential(
+            # capture local pulse upslope (RF≈7)
+            nn.Conv1d(in_channels,
+                      cnn_out_channels,
+                      kernel_size=7,
+                      padding=3),
+            nn.GroupNorm(num_groups=max(1, cnn_out_channels//4),
+                         num_channels=cnn_out_channels),
+            nn.GELU(),
+            # deeper local features
+            nn.Conv1d(cnn_out_channels,
+                      cnn_out_channels,
+                      kernel_size=5,
+                      padding=2),
+            nn.GroupNorm(num_groups=max(1, cnn_out_channels//4),
+                         num_channels=cnn_out_channels),
+            nn.GELU(),
+            # downsample temporal dim by 2
+            nn.Conv1d(cnn_out_channels,
+                      cnn_out_channels,
+                      kernel_size=3,
+                      padding=1,
+                      stride=2),
+            nn.Dropout(dropout_rate)
+        )
+
+        # Multi-scale block for mid/long-range
+        self.multi_scale_block = MultiScaleTemporalBlock(
+            in_channels=cnn_out_channels,
+            embedding_dim=embedding_dim,
+            dropout_rate=dropout_rate
+        )
+
+        # Initialize weights for Conv and Linear
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, (nn.Conv1d, nn.Linear)):
+                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, T) or (B, T, 1)
+        if x.dim() == 2:
+            x = x.unsqueeze(1)       # → (B, 1, T)
+        elif x.shape[2] == 1:
+            x = x.transpose(1, 2)    # → (B, 1, T)
+
+        # Stem: local conv + downsampling → (B, C, T/2)
+        x_cnn = self.stem(x)
+        # Multi-scale temporal encoding → (B, embedding_dim)
+        emb = self.multi_scale_block(x_cnn)
+        return emb
+
+'''
+# =============================================
 # MTDEv11: Optimized Multi-Scale Temporal Dynamics Encoder
 # =============================================
 import torch
@@ -118,7 +294,7 @@ class MTDE(nn.Module):
         # multi-scale temporal encoding
         emb = self.multi_scale_block(x_cnn)
         return emb
-
+'''
 '''
 # =============================================
 # MTDEv10: Multi-Scale Temporal Feature Extraction(16, 24, 32) using CNN + WeightedTemporalPooling
