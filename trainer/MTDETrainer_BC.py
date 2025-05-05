@@ -289,8 +289,8 @@ class MTDETrainer_BC(BaseTrainer):
         self.temperature = 1.0
         
         wandb.init(
-            project="TemporalReMOTION_MTDEv12",
-            name=f"Exp_Vlnc",
+            project="TemporalReMOTION_MTDE_normalized",
+            name=f"Exp_Arsl",
             # config=cfg_dict,
             dir="./wandb_logs"
         )

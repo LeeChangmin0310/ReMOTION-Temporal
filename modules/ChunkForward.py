@@ -1,6 +1,8 @@
+
 import torch
 import torch.nn as nn
 import torch.utils.checkpoint as checkpoint
+from scipy.signal import butter, filtfilt
 
 
 class ChunkForwardModule(nn.Module):
@@ -76,7 +78,22 @@ class ChunkForwardModule(nn.Module):
         for s in range(0, x.size(0), self.micro_bs):
             outs.append(_ex(x[s:s + self.micro_bs]))
         return torch.cat(outs, 0).detach()        # (N, T_rppg)
+   
+    def preprocess_rppg(batch, fs=30.0):
+        # band‑pass
+        b, a = butter(2, [0.7/(fs/2), 4/(fs/2)], 'band')
+        filt = torch.tensor(
+            filtfilt(b, a, batch.cpu().numpy(), axis=1),
+            dtype=batch.dtype, device=batch.device
+        )
+        # 세션‑min‑max
+        min_v = filt.min(dim=1, keepdim=True).values
+        max_v = filt.max(dim=1, keepdim=True).values
+        norm  = (filt - min_v) / (max_v - min_v + 1e-6)
+        return torch.stack([norm, filt], dim=1)  # (B, 2, T)
 
+    
+    
     # ------------------------------------------------------------------ #
     # Main forward
     # ------------------------------------------------------------------ #
@@ -105,14 +122,14 @@ class ChunkForwardModule(nn.Module):
         mean = rppg.mean(dim=1, keepdim=True)
         std = rppg.std(dim=1, keepdim=True)
         rppg_norm = (rppg - mean) / (std + 1e-6)
-        # x_input = torch.stack([x_chunk_norm, x], dim=1)
+        # rppg_norm = torch.stack([rppg_norm, rppg], dim=1)
         rppg_norm = rppg_norm.unsqueeze(-1)
         #"""
         # 3) TemporalBranch (optionally checkpointed)
         if self.use_checkpoint:
-            emb = checkpoint.checkpoint(self._temporal, rppg)
+            emb = checkpoint.checkpoint(self._temporal, rppg_norm)
         else:
-            emb = self.encoder(rppg)      # (N, D)
+            emb = self.encoder(rppg_norm)      # (N, D)
 
         return emb
 
@@ -142,6 +159,20 @@ class ChunkForwardModule(nn.Module):
 
     def forward_temporal(self, rppg_norm):
         return self.temporal_branch(rppg_norm)
+    
+    def preprocess_rppg(batch, fs=30.0):
+        # band‑pass
+        b, a = signal.butter(2, [0.7/(fs/2), 4/(fs/2)], 'band')
+        filt = torch.tensor(
+            signal.filtfilt(b, a, batch.cpu().numpy(), axis=1),
+            dtype=batch.dtype, device=batch.device
+        )
+        # 세션‑min‑max
+        min_v = filt.min(dim=1, keepdim=True).values
+        max_v = filt.max(dim=1, keepdim=True).values
+        norm  = (filt - min_v) / (max_v - min_v + 1e-6)
+        return torch.stack([norm, filt], dim=1)  # (B, 2, T)
+
 
     def forward(self, chunk_data):
         # chunk_data: (1, C, T, H, W)
