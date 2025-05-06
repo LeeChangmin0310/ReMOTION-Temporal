@@ -290,7 +290,7 @@ class MTDETrainer_BC(BaseTrainer):
         
         wandb.init(
             project="TemporalReMOTION_MTDE_normalized",
-            name=f"Exp_Arsl",
+            name=f"Exp_Vlnc_3b_nogate",
             # config=cfg_dict,
             dir="./wandb_logs"
         )
@@ -499,7 +499,7 @@ class MTDETrainer_BC(BaseTrainer):
         
         # ───────────────────── Phase-2 ─────────────────────
         elif epoch >= PHASE_BOUND[1]:                          
-            phase, lr, wd, t_max    = 2, 1e-4, 2e-4, 20                                 # (= 15 × 1.0)
+            phase, lr, wd, t_max    = 2, 1e-3, 2e-4, 20                                 # (= 15 × 1.0)
             self.lambda_ent         = 0.0
             self.contrastive_weight = 0.0
             self.chunk_ce_weight    = 0.0

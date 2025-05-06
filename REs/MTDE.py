@@ -1,3 +1,94 @@
+'''
+# =============================================================
+# Slim‑MTDE (4‑Branch, Physiology‑tuned)
+# =============================================================
+import torch, torch.nn as nn, torch.nn.functional as F
+
+# -------- utility -----------------------------------------------------------
+def same_conv(cin, cout, k, d):
+    """Same‑length Conv1d with automatic padding."""
+    return nn.Conv1d(cin, cout, k, padding=int((k-1)*d/2), dilation=d)
+
+# -------- pooling: softmax + channel gate -----------------------------------
+class SoftmaxGatePool(nn.Module):
+    """Temporal Softmax attention + channel‑wise sigmoid gate."""
+    def __init__(self, C):
+        super().__init__()
+        self.attn = nn.Conv1d(C, 1, 1)   # time‑attention scores
+        self.gate = nn.Linear(C, C)      # channel gate
+    def forward(self, x):                # x:(B,C,T)
+        w = torch.softmax(self.attn(x), dim=-1)
+        pooled = (x * w).sum(-1)         # (B,C)
+        return pooled * torch.sigmoid(self.gate(pooled))  # (B,C)
+
+# -------- multi‑scale block --------------------------------------------------
+class MultiScaleTemporalBlock(nn.Module):
+    """
+    RFs after MaxPool(2) :  6 | 34 | 60 | 120 frames
+    Channel map          :  8 | 16 | 24 | 32  = 80 (GroupNorm 8)
+    """
+    def __init__(self, cin=24, emb=256, dp=0.2):
+        super().__init__()
+        self.br_us = nn.Sequential(            # Ultra‑short 6f
+            same_conv(cin,  8, k=3, d=1), nn.GELU(), nn.MaxPool1d(2))
+        self.br_s  = nn.Sequential(            # Short 34f
+            same_conv(cin, 16, k=5, d=4), nn.GELU(), nn.MaxPool1d(2))
+        self.br_m  = nn.Sequential(            # Medium 60f
+            same_conv(cin, 24, k=5, d=15), nn.GELU(), nn.MaxPool1d(2))
+        self.br_l  = nn.Sequential(            # Long 120f
+            same_conv(cin, 32, k=3, d=30), nn.GELU(), nn.MaxPool1d(2))
+
+        C_total = 80
+        self.norm = nn.GroupNorm(8, C_total)   # 80/8 = 10
+        self.drop = nn.Dropout(dp)
+        self.pool = SoftmaxGatePool(C_total)
+        self.proj = nn.Linear(C_total, emb)
+
+    def forward(self, x):                      # (B,C,T)
+        cat = torch.cat([self.br_us(x),
+                         self.br_s (x),
+                         self.br_m (x),
+                         self.br_l (x)], dim=1)     # (B,80,T')
+        cat = self.drop(self.norm(cat))
+        return F.gelu(self.proj(self.pool(cat)))    # (B,emb)
+
+# -------- slim stem ----------------------------------------------------------
+class SlimStem(nn.Sequential):
+    """Conv5 (upslope) + Conv3‑stride2 (learnable downsampling)."""
+    def __init__(self, cin=1, cout=24, dp=0.1):
+        super().__init__(
+            nn.Conv1d(cin, cout, 5, padding=2),
+            nn.GroupNorm(4, cout), nn.GELU(),
+            nn.Conv1d(cout, cout, 3, padding=1, stride=2),
+            nn.Dropout(dp))
+
+# -------- full encoder -------------------------------------------------------
+class MTDE(nn.Module):
+    """
+    rPPG chunk (128 samples) -> 256‑D embedding.
+    """
+    def __init__(self,
+                 in_channels: int = 1,
+                 cnn_out_channels: int = 24,
+                 embedding_dim: int = 256,
+                 dropout_rate: float = 0.1):        
+        super().__init__()
+        self.stem = SlimStem(in_channels, cnn_out_channels, dropout_rate)
+        self.mstb = MultiScaleTemporalBlock(cnn_out_channels, embedding_dim, dropout_rate)
+        self.apply(self._init)
+
+    @staticmethod
+    def _init(m):
+        if isinstance(m, (nn.Conv1d, nn.Linear)):
+            nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+            if m.bias is not None: nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        if x.dim() == 2: x = x.unsqueeze(1)      # (B,1,T)
+        elif x.shape[2] == 1: x = x.transpose(1,2)
+        return self.mstb(self.stem(x))
+
+'''
 # =============================================================
 # Slim‑MTDE  (3‑branch RF = 6 / 60 / 120  +  Softmax‑Gate pool)
 # =============================================================
@@ -19,8 +110,9 @@ class SoftmaxGatePool(nn.Module):
     def forward(self, x):
         w = torch.softmax(self.attn(x), dim=-1)      # (B,1,T)
         pooled = (x * w).sum(-1)                     # (B,C)
-        gated  = pooled * torch.sigmoid(self.gate(pooled))
-        return gated                                 # (B,C)
+        return pooled
+        # gated  = pooled * torch.sigmoid(self.gate(pooled))
+        # return gated                                 # (B,C)
 
 # -------------------------------------------------------------
 # 2.  Multi‑scale block : RF 6 / 60 / 120 frames

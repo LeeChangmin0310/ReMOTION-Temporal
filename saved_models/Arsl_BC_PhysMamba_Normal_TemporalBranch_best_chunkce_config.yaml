@@ -57,8 +57,8 @@ MODEL:
     FRAME_NUM: 160
 NUM_OF_GPU_TRAIN: 1
 RESULTS:
-  accuracy: 0.5094339622641509
-  best_epoch: 28
+  accuracy: 0.6037735849056604
+  best_epoch: 29
   confusion_matrix: !!python/object/apply:numpy.core.multiarray._reconstruct
     args:
     - !!python/name:numpy.ndarray ''
@@ -87,11 +87,11 @@ RESULTS:
       - 0
     - false
     - !!binary |
-      EwAAAAAAAAAJAAAAAAAAABEAAAAAAAAACAAAAAAAAAA=
-  f1_score: 0.38095238095238104
+      DAAAAAAAAAAQAAAAAAAAAAUAAAAAAAAAFAAAAAAAAAA=
+  f1_score: 0.6557377049180328
   tag: best_chunkce
-  train_loss: 2.6504708056179984
-  valid_loss: 0.7089167136066364
+  train_loss: 2.73555263033453
+  valid_loss: 0.6821425141028639
 ReMOTION_MODE: train_and_test
 TEST:
   BATCH_SIZE: 1
