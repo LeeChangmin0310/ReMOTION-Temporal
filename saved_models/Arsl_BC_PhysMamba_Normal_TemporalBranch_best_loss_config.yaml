@@ -57,8 +57,8 @@ MODEL:
     FRAME_NUM: 160
 NUM_OF_GPU_TRAIN: 1
 RESULTS:
-  accuracy: 0.660377358490566
-  best_epoch: 45
+  accuracy: 0.5094339622641509
+  best_epoch: 66
   confusion_matrix: !!python/object/apply:numpy.core.multiarray._reconstruct
     args:
     - !!python/name:numpy.ndarray ''
@@ -87,11 +87,11 @@ RESULTS:
       - 0
     - false
     - !!binary |
-      GQAAAAAAAAADAAAAAAAAAA8AAAAAAAAACgAAAAAAAAA=
-  f1_score: 0.5263157894736842
+      BwAAAAAAAAAVAAAAAAAAAAUAAAAAAAAAFAAAAAAAAAA=
+  f1_score: 0.6060606060606061
   tag: best_loss
-  train_loss: 0.5465530691281805
-  valid_loss: 0.658520187971727
+  train_loss: 0.7141997094424266
+  valid_loss: 0.697281005247584
 ReMOTION_MODE: train_and_test
 TEST:
   BATCH_SIZE: 1
@@ -260,7 +260,7 @@ TRAIN:
       USE_PSUEDO_PPG_LABEL: false
     SPLIT_METHOD: ''
     current_subject: null
-  EPOCHS: 50
+  EPOCHS: 70
   LR: 0.0003
   MODEL_FILE_NAME: Arsl_BC_PhysMamba_Normal_TemporalBranch
   NUM_CLASSES: 2

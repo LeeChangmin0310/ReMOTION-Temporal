@@ -191,49 +191,6 @@ def create_data_loaders(loader_cls, config):
                              collate_fn=custom_collate_fn)
     return {"train": train_loader, "valid": valid_loader, "test": test_loader}
 
-        
-def run_LOSO_fold(config, subject_id):
-    """
-    Runs one LOSO fold with the given subject_id as the test subject.
-    Updates config.TRAIN.DATA.current_subject.
-    Returns validation metric and best epoch.
-    """
-    print(f"\n=== LOSO: Leaving subject {subject_id} out ===")
-    config.defrost()
-    config.TRAIN.DATA.current_subject = subject_id
-    config.VALID.DATA.current_subject = subject_id
-    config.TEST.DATA.current_subject = subject_id
-    config.freeze()
-
-    loader_cls = data_loader.MAHNOBHCILoader.MAHNOBHCILoader
-    data_loader_dict = create_data_loaders(loader_cls, config)
-
-    trainer_obj = select_trainer(config, data_loader_dict)
-    trainer_obj.train(data_loader_dict)
-    trainer_obj.test(data_loader_dict)
-    return trainer_obj.min_valid_loss, trainer_obj.best_epoch
-
-def run_kfold_fold(config, fold_index):
-    """
-    Runs one k_fold fold based on the given fold index.
-    Updates config.TRAIN.DATA.FOLD_INDEX.
-    Returns validation metric and best epoch.
-    """
-    print(f"\n=== k_fold: Fold {fold_index} ===")
-    config.defrost()
-    config.TRAIN.DATA.FOLD_INDEX = fold_index
-    config.VALID.DATA.FOLD_INDEX = fold_index
-    config.TEST.DATA.FOLD_INDEX = fold_index
-    config.freeze()
-
-    loader_cls = data_loader.MAHNOBHCILoader.MAHNOBHCILoader
-    data_loader_dict = create_data_loaders(loader_cls, config)
-
-    trainer_obj = select_trainer(config, data_loader_dict)
-    trainer_obj.train(data_loader_dict)
-    trainer_obj.test(data_loader_dict)
-    return trainer_obj.min_valid_loss, trainer_obj.best_epoch
-
 def train_and_test(config, data_loader_dict):
     """Trains and tests the model."""
     model_trainer = select_trainer(config, data_loader_dict)
@@ -260,40 +217,14 @@ if __name__ == "__main__":
     # The overall pipeline is controlled by ReMOTION_MODE.
     # SPLIT_METHOD only defines how the data is partitioned.
     if config.ReMOTION_MODE in ["train_and_test", "only_test"]:
-        # If cross-validation is set in the data config, perform it.
-        if config.TRAIN.DATA.SPLIT_METHOD == "LOSO":
-            loader_cls = data_loader.MAHNOBHCILoader.MAHNOBHCILoader
-            temp_loader = loader_cls(name="temp",
-                                     data_path=config.TRAIN.DATA.DATA_PATH,
-                                     config_data=config.TRAIN.DATA,
-                                     device=config.DEVICE)
-            subject_list = temp_loader.get_all_subject_ids()
-            print("Subject IDs:", subject_list)
-            fold_results = {}
-            for subj in subject_list:
-                val_loss, best_epoch = run_LOSO_fold(config, subj)
-                fold_results[subj] = {"val_loss": val_loss, "best_epoch": best_epoch}
-            print("\n=== LOSO Cross-Validation Results ===")
-            for subj, metrics in fold_results.items():
-                print(f"Subject {subj}: Val Loss = {metrics['val_loss']}, Best Epoch = {metrics['best_epoch']}")
-        elif config.TRAIN.DATA.SPLIT_METHOD == "k_fold":
-            num_folds = config.TRAIN.DATA.NUM_FOLDS
-            fold_results = {}
-            for fold_idx in range(num_folds):
-                val_loss, best_epoch = run_kfold_fold(config, fold_idx)
-                fold_results[fold_idx] = {"val_loss": val_loss, "best_epoch": best_epoch}
-            print("\n=== k_fold Cross-Validation Results ===")
-            for fold_idx, metrics in fold_results.items():
-                print(f"Fold {fold_idx}: Val Loss = {metrics['val_loss']}, Best Epoch = {metrics['best_epoch']}")
-        else:
-            # Normal supervised mode (without cross-validation)
-            loader_cls = data_loader.MAHNOBHCILoader.MAHNOBHCILoader
-            if config.ReMOTION_MODE == "train_and_test":
-                data_loader_dict = create_data_loaders(loader_cls, config)
-                train_and_test(config, data_loader_dict)
-            elif config.ReMOTION_MODE == "only_test":
-                data_loader_dict = create_data_loaders(loader_cls, config)
-                test(config, data_loader_dict)
+        # Normal supervised mode (without cross-validation)
+        loader_cls = data_loader.MAHNOBHCILoader.MAHNOBHCILoader
+        if config.ReMOTION_MODE == "train_and_test":
+            data_loader_dict = create_data_loaders(loader_cls, config)
+            train_and_test(config, data_loader_dict)
+        elif config.ReMOTION_MODE == "only_test":
+            data_loader_dict = create_data_loaders(loader_cls, config)
+            test(config, data_loader_dict)
     else:
         raise ValueError("Unsupported ReMOTION_MODE!")
     '''

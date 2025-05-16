@@ -229,7 +229,7 @@ from modules.ChunkAuxClassifier import ChunkAuxClassifier
 from tools.utils import SupConLossTopK, FocalLoss
 from tools.utils import reconstruct_sessions, run_tsne_and_plot, straight_through_topk
 
-PHASE_BOUND = [15, 30]
+PHASE_BOUND = [20, 40]
 
 class MTDETrainer_BC(BaseTrainer):
     """
@@ -290,7 +290,7 @@ class MTDETrainer_BC(BaseTrainer):
         
         wandb.init(
             project="TemporalReMOTION_MTDE_normalized",
-            name=f"Exp_Vlnc_3b_nogate",
+            name=f"Exp_Arsl_70epochs",
             # config=cfg_dict,
             dir="./wandb_logs"
         )
@@ -359,6 +359,7 @@ class MTDETrainer_BC(BaseTrainer):
             input_dim=config.MODEL.EMOTION.TEMPORAL_EMBED_DIM,
             num_classes=config.TRAIN.NUM_CLASSES
         ).to(self.device)
+        self.logit_scale = nn.Parameter(torch.tensor(1.0, device=self.device) * 2.0)
 
         # ----------------------------- Chunk Forward Module ----------------------------
         self.chunk_forward_module = ChunkForwardModule(
@@ -477,7 +478,7 @@ class MTDETrainer_BC(BaseTrainer):
             self.temperature        = 1.0
 
             # ─── Phase1a ─── epochs 15–19 ───
-            if sub < 5:
+            if sub < 7:
                 # chunk CE: 0.5→1.0 over 5 epochs
                 self.chunk_ce_weight = 0.5 + sub * (0.5/5)
                 # Top-K: 0.6→0.5
@@ -485,7 +486,7 @@ class MTDETrainer_BC(BaseTrainer):
                 self.ce_weight       = 0.0
 
             # ─── Phase1b ─── epochs 20–24 ───
-            elif sub < 10:
+            elif sub < 14:
                 self.chunk_ce_weight = 1.0
                 # Top-K: 0.5→0.3 over next 5 epochs
                 self.top_k_ratio     = 0.5 - (sub-5) * (0.2/5)
@@ -495,25 +496,23 @@ class MTDETrainer_BC(BaseTrainer):
             else:
                 self.chunk_ce_weight = 1.0
                 self.top_k_ratio     = 0.3
-                self.ce_weight       = (sub-10) * (0.5/5)                               # 0 → 0.5 over 5 epochs (cushion)
+                self.ce_weight       = (sub-13) * 0.1                                   # 0 → 0.5 over 5 epochs (cushion)
+                # self.classifier = deepcopy(self.chunk_aux_classifier.train())           # # copy chunk_aux → session-level classifier
+                self.classifier.load_state_dict(self.chunk_aux_classifier.state_dict())
         
         # ───────────────────── Phase-2 ─────────────────────
         elif epoch >= PHASE_BOUND[1]:                          
-            phase, lr, wd, t_max    = 2, 1e-3, 2e-4, 20                                 # (= 15 × 1.0)
+            phase, lr, wd, t_max    = 2, 1e-4, 1e-4, 30                                 # (= 15 × 1.0)
             self.lambda_ent         = 0.0
             self.contrastive_weight = 0.0
             self.chunk_ce_weight    = 0.0
             self.top_k_ratio        = 0.0
-            self.ce_weight          = min(1.0, 0.5 + 0.02 * (epoch - PHASE_BOUND[1]))   # 0.5 → 1.0
+            self.ce_weight          = min(1.0, 0.7 + 0.05 * (epoch - PHASE_BOUND[1]))   # 0.7 → 1.0
             self.temperature        = 1.0
-            
-            # copy chunk_aux → session-level classifier
-            if epoch == PHASE_BOUND[1]:
-                self.classifier = deepcopy(self.chunk_aux_classifier.train())
             
         # ─────── Gradient gate ───────
         for p in self.attn_scorer.parameters():
-            p.requires_grad = True
+            p.requires_grad = (epoch < 40)
         for p in self.mtde.parameters():
             p.requires_grad = True
         for p in self.chunk_projection.parameters():
@@ -521,12 +520,20 @@ class MTDETrainer_BC(BaseTrainer):
         for p in self.chunk_aux_classifier.parameters():
             p.requires_grad = (phase == 1)
         for p in self.pooling.parameters():
-            p.requires_grad = (phase == 2) or (phase == 1 and epoch - PHASE_BOUND[0] >= 10)
+            p.requires_grad = (phase == 2)  or (phase == 1 and epoch - PHASE_BOUND[0] >= 13)
         for p in self.classifier.parameters():
-            p.requires_grad = (phase == 2)
-
+            p.requires_grad = (phase == 2)  or (phase == 1 and epoch - PHASE_BOUND[0] >= 13)
+        
+        # ─────── Optimizer/Scheduler setup ───────
+        if not hasattr(self, "cur_phase"):
+            self.cur_phase = -1
+            
         # Reconfigure optimizer/scheduler per phase
-        frozen = self.configure_optimizer_scheduler(lr, wd, t_max, phase)
+        if self.cur_phase != phase:
+            self.cur_phase = phase
+            frozen = self.configure_optimizer_scheduler(lr, wd, t_max, phase)
+        else:
+            frozen = []
         
         # SupConLoss sampling scheduling (e.g., threshold, top-k mask, etc.)
         self.contrastive_loss_fn.schedule_params(epoch, self.max_epoch)
@@ -541,17 +548,22 @@ class MTDETrainer_BC(BaseTrainer):
         * phase 0 : AttnScorer LR = 1.00 × lr
         * phase 1 : AttnScorer LR = 1.00 × lr   
         * phase 2 : AttnScorer LR = 0.50 × lr   (fine-tuning)
-        """
-        # ------------------------------------------------------------------
+        
         lr_scale_as = 1.0 if phase < 2 else 0.5
         lr_raw      = lr                     # default lr per phase
         lr_as       = lr * lr_scale_as       # lr for AttnScorer
+        """
+        # ------------------------------------------------------------------
+        
+        lr_scale_ce = 1.0 if phase < 2 else 5.0
+        lr_raw      = lr                     # default lr per phase
+        lr_ce       = lr * lr_scale_ce       # lr for session classifier
         # ------------------------------------------------------------------
 
         pg_decay, pg_nodecay, frozen = [], [], []
 
         def add_param(param, name, lr_this):
-            is_nd = ("bias" in name or "LayerNorm" in name)
+            is_nd = ("bias" in name)#or "LayerNorm" in name)
             group  = pg_nodecay if is_nd else pg_decay
             group.append(
                 {"params": param,
@@ -562,7 +574,7 @@ class MTDETrainer_BC(BaseTrainer):
         # --------- params setup ---------
         modules = [
             (self.mtde,                lr_raw),
-            (self.attn_scorer,         lr_as),
+            (self.attn_scorer,         lr_raw),
             (self.pooling,             lr_raw),
             (self.chunk_projection,    lr_raw),
             (self.chunk_aux_classifier,lr_raw),
@@ -769,7 +781,11 @@ class MTDETrainer_BC(BaseTrainer):
         # Session CE (always computed)
         sess_mat   = torch.stack(session_embeds, 0)
         label_vec  = torch.tensor(target_labels, dtype=torch.long, device=self.device)
-        ce_logits  = self.classifier(sess_mat)
+        logits_raw  = self.classifier(sess_mat)
+        if phase == 2:
+            ce_logits = self.logit_scale * logits_raw
+        else:                       
+            ce_logits = logits_raw.detach() + logits_raw - logits_raw.detach()
         ce_loss    = self.criterion(ce_logits, label_vec)
 
         # ───── scaled terms (for debug table) ───────────────

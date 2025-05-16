@@ -53,10 +53,12 @@ class GatedPooling(nn.Module):
         """
         # attn_weights = entmax.entmax15(attn_scores, dim=1)  # (B, T, 1)
         # attn_weights = F.softmax(attn_scores, dim=1)  # (B, T, 1)
-        if self.training:
-            alpha_g = 1.7 + 0.3 * min((epoch - 30) / 19, 1.0)                       # 1.7 → 2.0 over epochs 30→50
+        if self.training and epoch < 60:
+            alpha_g = 2.0 + 0.3 * min((epoch - 40) / 19, 1.0)                       # 1.7 → 2.0 over epochs 30→50
         elif epoch == None or not self.training: 
-            alpha_g = 2.0
+            alpha_g = 2.3
+        else:
+            alpha_g = 2.3
         attn_weights = entmax.entmax_bisect(attn_scores, alpha=alpha_g, dim=1)      # (B, T, 1)
 
         gate = self.gate(x)                                                         # (B, T, D)

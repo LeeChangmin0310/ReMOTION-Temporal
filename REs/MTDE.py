@@ -1,3 +1,157 @@
+"""
+          ┌─ Short ─┐
+rPPG ─▶ Stem ─▶ Branches ─▶ Feature map F(B,72,T)
+          └─ Mid ───┘
+          └─ Long ──┘
+"""
+
+import entmax
+# =============================================================
+# Slim‑MTDE  (3‑branch RF = 6 / 60 / 120  +  Softmax‑Gate pool)
+# =============================================================
+'''
+class MultiScaleTemporalBlock(nn.Module):
+    def __init__(self, Cin=24, emb_dim=256, dropout=0.2):
+        super().__init__()
+        # Short  RF = 3 (Conv)  -> 6 after MaxPool
+        self.br_short = nn.Sequential(
+            same_conv(Cin, 16, k=3, d=1),
+            nn.GELU(), nn.MaxPool1d(2)
+        )
+        # Medium RF = 29 -> 58 (≈2 s)
+        self.br_mid = nn.Sequential(
+            same_conv(Cin, 24, k=5, d=15),
+            nn.GELU(), nn.MaxPool1d(2)
+        )
+        # Long   RF = 121 -> 242 (covers whole 128‑frame chunk)
+        self.br_long = nn.Sequential(
+            same_conv(Cin, 32, k=3, d=60),
+            nn.GELU(), nn.MaxPool1d(2)
+        )
+
+        C_total = 16 + 24 + 32
+        self.norm  = nn.GroupNorm(8, C_total)
+        self.drop  = nn.Dropout(dropout)
+        self.pool  = SoftmaxGatePool(C_total)
+        self.proj  = nn.Linear(C_total, emb_dim)
+
+    def forward(self, x):                 # x: (B,C,T)
+        cat = torch.cat([self.br_short(x),
+                         self.br_mid  (x),
+                         self.br_long (x)], dim=1)   # Same T′ by design
+        cat = self.drop(self.norm(cat))
+        return F.gelu(self.proj(self.pool(cat)))     # (B, emb_dim)
+'''
+import torch, torch.nn as nn, torch.nn.functional as F
+
+# -------------------------------------------------------------
+# 1.  Softmax over time  +  channel‑wise sigmoid gate
+# -------------------------------------------------------------
+class SoftmaxPool(nn.Module):
+    """
+    Temporal soft‑attention followed by a per‑channel gate.
+    x: (B, C, T)  ->  out: (B, C)
+    """
+    def __init__(self, C):
+        super().__init__()
+        self.attn = nn.Conv1d(C, 1, kernel_size=1)   # time‑score
+        # self.gate = nn.Linear(C, C)                  # channel gate
+
+    def forward(self, x):
+        w = torch.softmax(self.attn(x), dim=-1)      # (B,1,T)
+        #w = entmax.entmax_bisect(self.attn(x), alpha=1.2, dim=-1)
+
+        pooled = (x * w).sum(-1)                     # (B,C)
+        return pooled
+        # gated  = pooled * torch.sigmoid(self.gate(pooled))
+        # return gated                                 # (B,C)
+# -------------------------------------------------------------
+# 2.  Multi‑scale block : RF 6 / 60 / 120 frames
+# -------------------------------------------------------------
+def same_conv(Cin, Cout, k, d):
+    """Length‑preserving Conv1d (padding = (k‑1)*d/2)."""
+    p = int((k - 1) * d / 2)
+    return nn.Conv1d(Cin, Cout, kernel_size=k, padding=p, dilation=d)
+
+# ------------------------------------------------
+# ② Multi‑scale block (RF: 6 / 66 / 129 frame)
+class MultiScaleTemporalBlock(nn.Module):
+    """
+    Short  : RF 6  (pulse upslope)
+    Medium : RF 66 (~2.2 s, HF‑HRV)
+    Long   : RF 129 (~4.3 s, chunk 전체)
+    """
+    def __init__(self, Cin=24, emb_dim=256, dropout=0.2):
+        super().__init__()
+
+        self.br_short = nn.Sequential(           # 3 → 6
+            same_conv(Cin, 16, k=3, d=3),
+            nn.GELU(), nn.MaxPool1d(2))
+
+        self.br_mid   = nn.Sequential(           # 33 → 66
+            same_conv(Cin, 24, k=5, d=8),
+            nn.GELU(), nn.MaxPool1d(2))
+
+        self.br_long  = nn.Sequential(           # 129 (no pool)
+            same_conv(Cin, 32, k=3, d=32),
+            nn.GELU(), nn.AdaptiveAvgPool1d(32))
+
+        C_total = 16 + 24 + 32                   # 72
+        self.norm = nn.GroupNorm(8, C_total)
+        self.drop = nn.Dropout(dropout)
+        self.pool = SoftmaxPool(C_total)         # ★ Softmax only
+        self.proj = nn.Linear(C_total, emb_dim)
+
+    def forward(self, x):                        # (B,C,T)
+        f_cat = torch.cat([
+            self.br_short(x),
+            self.br_mid(x),
+            self.br_long(x)
+        ], dim=1)                                # (B,72,T′)
+
+        f_cat = self.drop(self.norm(f_cat))
+        return F.gelu(self.proj(self.pool(f_cat)))  # (B,embed)
+# -------------------------------------------------------------
+# 3.  Slim Stem  (Conv5 → Conv3 stride‑2)
+# -------------------------------------------------------------
+class SlimStem(nn.Sequential):
+    def __init__(self, Cin=1, Cout=24, drop=0.1):
+        super().__init__(
+            nn.Conv1d(Cin, Cout, kernel_size=5, padding=2),
+            nn.GroupNorm(4, Cout), nn.GELU(),
+            nn.Conv1d(Cout, Cout, kernel_size=3, padding=1, stride=2),
+            nn.Dropout(drop)
+        )
+# -------------------------------------------------------------
+# 4.  Full MTDE encoder
+# -------------------------------------------------------------
+class MTDE(nn.Module):
+    """
+    rPPG chunk (128 samples) -> 256‑D embedding.
+    """
+    def __init__(self,
+                 in_channels: int = 1,
+                 cnn_out_channels: int = 24,
+                 embedding_dim: int = 256,
+                 dropout_rate: float = 0.1):        
+        super().__init__()
+        self.stem = SlimStem(in_channels, cnn_out_channels, dropout_rate)
+        self.mstb = MultiScaleTemporalBlock(cnn_out_channels, embedding_dim, dropout_rate)
+        self.apply(self._init)
+
+    @staticmethod
+    def _init(m):
+        if isinstance(m, (nn.Conv1d, nn.Linear)):
+            nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+            if m.bias is not None: nn.init.zeros_(m.bias)
+
+    def forward(self, x):                 # x: (B,T) or (B,T,1)
+        if x.dim() == 2:
+            x = x.unsqueeze(1)            # (B,1,T)
+        elif x.shape[2] == 1:
+            x = x.transpose(1, 2)         # (B,1,T)
+        z = self.stem(x)                  # (B,C,T/2)
+        return self.mstb(z)               # (B, emb_dim)
 '''
 # =============================================================
 # Slim‑MTDE (4‑Branch, Physiology‑tuned)
@@ -89,113 +243,6 @@ class MTDE(nn.Module):
         return self.mstb(self.stem(x))
 
 '''
-# =============================================================
-# Slim‑MTDE  (3‑branch RF = 6 / 60 / 120  +  Softmax‑Gate pool)
-# =============================================================
-import torch, torch.nn as nn, torch.nn.functional as F
-
-# -------------------------------------------------------------
-# 1.  Softmax over time  +  channel‑wise sigmoid gate
-# -------------------------------------------------------------
-class SoftmaxGatePool(nn.Module):
-    """
-    Temporal soft‑attention followed by a per‑channel gate.
-    x: (B, C, T)  ->  out: (B, C)
-    """
-    def __init__(self, C):
-        super().__init__()
-        self.attn = nn.Conv1d(C, 1, kernel_size=1)   # time‑score
-        self.gate = nn.Linear(C, C)                  # channel gate
-
-    def forward(self, x):
-        w = torch.softmax(self.attn(x), dim=-1)      # (B,1,T)
-        pooled = (x * w).sum(-1)                     # (B,C)
-        return pooled
-        # gated  = pooled * torch.sigmoid(self.gate(pooled))
-        # return gated                                 # (B,C)
-
-# -------------------------------------------------------------
-# 2.  Multi‑scale block : RF 6 / 60 / 120 frames
-# -------------------------------------------------------------
-def same_conv(Cin, Cout, k, d):
-    """Length‑preserving Conv1d (padding = (k‑1)*d/2)."""
-    p = int((k - 1) * d / 2)
-    return nn.Conv1d(Cin, Cout, kernel_size=k, padding=p, dilation=d)
-
-class MultiScaleTemporalBlock(nn.Module):
-    def __init__(self, Cin=24, emb_dim=256, dropout=0.2):
-        super().__init__()
-        # Short  RF = 3 (Conv)  -> 6 after MaxPool
-        self.br_short = nn.Sequential(
-            same_conv(Cin, 16, k=3, d=1),
-            nn.GELU(), nn.MaxPool1d(2)
-        )
-        # Medium RF = 29 -> 58 (≈2 s)
-        self.br_mid = nn.Sequential(
-            same_conv(Cin, 24, k=5, d=15),
-            nn.GELU(), nn.MaxPool1d(2)
-        )
-        # Long   RF = 121 -> 242 (covers whole 128‑frame chunk)
-        self.br_long = nn.Sequential(
-            same_conv(Cin, 32, k=3, d=60),
-            nn.GELU(), nn.MaxPool1d(2)
-        )
-
-        C_total = 16 + 24 + 32
-        self.norm  = nn.GroupNorm(8, C_total)
-        self.drop  = nn.Dropout(dropout)
-        self.pool  = SoftmaxGatePool(C_total)
-        self.proj  = nn.Linear(C_total, emb_dim)
-
-    def forward(self, x):                 # x: (B,C,T)
-        cat = torch.cat([self.br_short(x),
-                         self.br_mid  (x),
-                         self.br_long (x)], dim=1)   # Same T′ by design
-        cat = self.drop(self.norm(cat))
-        return F.gelu(self.proj(self.pool(cat)))     # (B, emb_dim)
-
-# -------------------------------------------------------------
-# 3.  Slim Stem  (Conv5 → Conv3 stride‑2)
-# -------------------------------------------------------------
-class SlimStem(nn.Sequential):
-    def __init__(self, Cin=1, Cout=24, drop=0.1):
-        super().__init__(
-            nn.Conv1d(Cin, Cout, kernel_size=5, padding=2),
-            nn.GroupNorm(4, Cout), nn.GELU(),
-            nn.Conv1d(Cout, Cout, kernel_size=3, padding=1, stride=2),
-            nn.Dropout(drop)
-        )
-
-# -------------------------------------------------------------
-# 4.  Full MTDE encoder
-# -------------------------------------------------------------
-class MTDE(nn.Module):
-    """
-    rPPG chunk (128 samples) -> 256‑D embedding.
-    """
-    def __init__(self,
-                 in_channels: int = 1,
-                 cnn_out_channels: int = 24,
-                 embedding_dim: int = 256,
-                 dropout_rate: float = 0.1):        
-        super().__init__()
-        self.stem = SlimStem(in_channels, cnn_out_channels, dropout_rate)
-        self.mstb = MultiScaleTemporalBlock(cnn_out_channels, embedding_dim, dropout_rate)
-        self.apply(self._init)
-
-    @staticmethod
-    def _init(m):
-        if isinstance(m, (nn.Conv1d, nn.Linear)):
-            nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
-            if m.bias is not None: nn.init.zeros_(m.bias)
-
-    def forward(self, x):                 # x: (B,T) or (B,T,1)
-        if x.dim() == 2:
-            x = x.unsqueeze(1)            # (B,1,T)
-        elif x.shape[2] == 1:
-            x = x.transpose(1, 2)         # (B,1,T)
-        z = self.stem(x)                  # (B,C,T/2)
-        return self.mstb(z)               # (B, emb_dim)
 
 '''
 # =============================================
