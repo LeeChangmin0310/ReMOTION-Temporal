@@ -143,7 +143,7 @@ If you use Windows or other operating systems, consider using [Windows Subsystem
 
 Please use config files under `./configs/infer_configs`
 
-For example, if you want to run The model pre-trained on UBFC-rPPG and train on MAHNOB-HCI, use `python main.py --config_file ./configs/infer_configs/python main.py --config ./configs/train_configs/Arsl_BC_Normal_PHYSMAMBA.yaml`
+For example, if you want to run The model pre-trained on UBFC-rPPG and train on MAHNOB-HCI, use `/python main.py --config ./configs/train_configs/Arsl_BC_Normal_PHYSMAMBA.yaml`
 
 **(will be updated)**
 If you want to test unsupervised signal processing  methods, you can use `python main.py --config_file ./configs/infer_configs/UBFC-rPPG_UNSUPERVISED.yaml`
