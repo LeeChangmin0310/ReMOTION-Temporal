@@ -1149,7 +1149,7 @@ class MTDETrainer_BC(BaseTrainer):
 
         for tag in tags:
             #"""
-            model_path = os.path.join("./saved_models", f"{base_name}_{tag}.pth")
+            model_path = os.path.join("./saved_models/6604", f"{base_name}_{tag}.pth")
             if not os.path.exists(model_path):
                 print(f"[SKIP] {tag} model not found at {model_path}")
                 continue

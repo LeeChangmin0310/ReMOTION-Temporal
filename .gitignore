@@ -3,7 +3,12 @@
 wandb_logs/
 __pycache__/
 *.pyc
+
 chunk_TSNE_train/
 chunk_TSNE_valid/
 session_TSNE_train/
 session_TSNE_valid/
+
+cuda-keyring_1.0-1_all.deb
+EDAandFiltering.ipynb
+tools/motion_analysis/
