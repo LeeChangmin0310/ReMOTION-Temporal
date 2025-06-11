@@ -3,3 +3,7 @@
 wandb_logs/
 __pycache__/
 *.pyc
+chunk_TSNE_train/
+chunk_TSNE_valid/
+session_TSNE_train/
+session_TSNE_valid/
