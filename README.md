@@ -28,24 +28,36 @@ Three phases (explore → chunk-refine → session-finetune) within **50 epochs*
 
 ## 🚀 Quick Start
 
+<details>
+<summary> Setup </summary>
+You can use either [`conda`](https://docs.conda.io/projects/conda/en/latest/user-guide/install/index.html) or [`uv`](https://docs.astral.sh/uv/getting-started/installation/).
+Most users are already familiar with `conda`, but `uv` may be a bit less familiar - check out some highlights about `uv` [here](https://docs.astral.sh/uv/#highlights). If you use `uv`, it's highly recommended you do so independently of `conda`, meaning you should make sure you're not installing anything in the base `conda` environment or any other `conda` environment. If you're having trouble making sure you're not in your base `conda` environment, try setting `conda config --set auto_activate_base false`.
+</details>
+
 ```bash
 git clone https://github.com/LeeChangmin0310/ReMOTION-Temporal.git
-cd EmotionRecognition-rPPG
+cd ReMOTION-Temporal
 bash setup.sh conda          # or: bash setup.sh uv
 conda activate remotion
 
 # train / validate / test
 python main.py --config configs/train_configs/Arsl_BC_Normal_PHYSMAMBA.yaml
 ```
+<details>
+<summary> NOTE </summary>
+The above setup should work without any issues on machines using Linux or MacOS. If you run into compiler-related issues using `uv` when installing tools related to mamba, try checking to see if `clang++` is in your path using `which clang++`. If nothing shows up, you can install `clang++` using `sudo apt-get install clang` on Linux or `xcode-select --install` on MacOS.
+
+If you use Windows or other operating systems, consider using [Windows Subsystem for Linux](https://learn.microsoft.com/en-us/windows/wsl/install) and following the steps within `setup.sh` independently.
+</details>
 
 ---
 
-## �\uddna Model Flow
+## 🧬 Model Architecture Flow
 
 <p align="center"><img src="docs/figures/architecture.png" width="80%" alt="Full Architecture"/></p>
 
-<details>
-<summary>Phase-by-Phase (0–14 | 15–29 | 30–49)</summary>
+
+### Phase-by-Phase (0–14 | 15–29 | 30–49)
 
 | Phase | Epochs |            Core Losses           |          Main Goal          |
 | :---: | :----: | :------------------------------: | :-------------------------: |
@@ -53,7 +65,6 @@ python main.py --config configs/train_configs/Arsl_BC_Normal_PHYSMAMBA.yaml
 |   1   |  15–29 | Focal Chunk-CE (+0.2 Session-CE) |    Chunk discriminability   |
 |   2   |  30–49 |         Session-CE (only)        |  Stable session classifier  |
 
-</details>
 
 ---
 
