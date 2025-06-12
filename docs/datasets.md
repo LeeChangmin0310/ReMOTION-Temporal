@@ -65,7 +65,7 @@ Add config in `configs/`, and define parameters in `config.py`.
 
 
 <details>
-<summary> :file_folder: ***Adding New Datasets*** </summary>
+<summary> :file_folder: Adding New Datasets </summary>
 rPPG extractor's pretrained weights are trained from seven datasets, namely SCAMPS, UBFC-rPPG, PURE, BP4D+, UBFC-Phys, MMPD and iBVP. Please cite the corresponding papers when using these datasets. For now, we recommend training with UBFC-rPPG, PURE, iBVP or SCAMPS due to the level of synchronization and volume of the datasets. 
 
 **To use these datasets in a deep learning model, you should organize the files as follows.**
