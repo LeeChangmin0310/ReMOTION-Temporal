@@ -65,8 +65,11 @@ Add config in `configs/`, and define parameters in `config.py`.
 
 
 <details>
-<summary> ## :file_folder: Adding Datasets </summary>
-rPPG extractor's pretrained weights are trained from seven datasets, namely SCAMPS, UBFC-rPPG, PURE, BP4D+, UBFC-Phys, MMPD and iBVP. Please cite the corresponding papers when using these datasets. For now, we recommend training with UBFC-rPPG, PURE, iBVP or SCAMPS due to the level of synchronization and volume of the datasets. **To use these datasets in a deep learning model, you should organize the files as follows.**
+<summary> :file_folder: ***Adding New Datasets*** </summary>
+rPPG extractor's pretrained weights are trained from seven datasets, namely SCAMPS, UBFC-rPPG, PURE, BP4D+, UBFC-Phys, MMPD and iBVP. Please cite the corresponding papers when using these datasets. For now, we recommend training with UBFC-rPPG, PURE, iBVP or SCAMPS due to the level of synchronization and volume of the datasets. 
+
+**To use these datasets in a deep learning model, you should organize the files as follows.**
+
 * [MMPD](https://github.com/McJackTang/MMPD_rPPG_dataset)
     * Jiankai Tang, Kequan Chen, Yuntao Wang, Yuanchun Shi, Shwetak Patel, Daniel McDuff, Xin Liu, "MMPD: Multi-Domain Mobile Video Physiology Dataset", IEEE EMBC, 2023
     -----------------
