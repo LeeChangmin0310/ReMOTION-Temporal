@@ -198,6 +198,7 @@ in: Proc. 23st IEEE Int. Symposium on Robot and Human Interactive Communication 
 
 <details>
 <summary> :open_file_folder: Adding a New Dataset </summary>
+
 * STEP 1: Create a new python file in `dataset/data_loader`, e.g. MyLoader.py
 
 * STEP 2: Implement the required functions, including:
@@ -217,6 +218,7 @@ in: Proc. 23st IEEE Int. Symposium on Robot and Human Interactive Communication 
 * STEP 3:[Optional] Override optional functions. In principle, all functions in BaseLoader can be override, but we **do not** recommend you to override *\_\_len\_\_, \_\_get\_item\_\_,save,load*.
 * STEP 4:Set or add configuration parameters.  To set paramteters, create new yaml files in configs/ .  Adding parameters requires modifying config.py, adding new parameters' definition and initial values.
 </details>
+
 ---
 
 ## 🧠 Add a New rPPG Extractor
@@ -252,7 +254,8 @@ def extract(self, video):
 
 <details>
 <summary> :notebook: Algorithms </summary>
-***This repo currently supports the following algorithms as a feature extractor:***
+
+**This repo currently supports the following algorithms as a feature extractor:**
 
 * Supervised Neural Algorithms 
   - [PhysMamba: Efficient Remote Physiological Measurement with SlowFast Temporal Difference Mamba](https://doi.org/10.48550/arXiv.2409.12031), by Luo *et al.*, 2024
@@ -280,6 +283,7 @@ This repo **will(or can) supports** the following algorithms as a feature extrac
   - [iBVPNet: 3D-CNN architecture introduced in iBVP dataset paper](https://doi.org/10.3390/electronics13071334), by Joshi *et al.*, 2024
   - [RhythmFormer: Extracting rPPG Signals Based on Hierarchical Temporal Periodic Transformer](https://doi.org/10.48550/arXiv.2402.12788), by Zou *et al.*, 2024
 </details>
+
 ---
 
 ## 🧪 Modify YAML Parameters
@@ -317,6 +321,7 @@ Here are some explanation of parameters:
   * `USE_SMALLER_WINDOW`: If `True`, use an evaluation window smaller than the video length for evaluation.
 
 </details>
+
 ---
 
 ## 📌 Tips
@@ -327,7 +332,6 @@ Here are some explanation of parameters:
 ---
 
 For more advanced customization, refer to `main.py`, `config.py`, and `trainers/`.
-
 
 
 ---
@@ -341,6 +345,3 @@ For more advanced customization, refer to `main.py`, `config.py`, and `trainers/
 
 ---
 
-
-<details>
-<summary> :file_folder: Adding New Datasets </summary>
