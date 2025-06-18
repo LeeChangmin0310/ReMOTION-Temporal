@@ -1,6 +1,6 @@
-# Emotion Recognition from rPPG
+# Emotion Recognition from rPPG via *Physiologically-Inspired Temporal Encoding and Attention-based Curriculum Learning*
+> UNDER REVIEW at special issue of MDPI Sensors(Sensing and Imaging; Emotion Recognition and Cognitive Behavior Analysis Based on Sensors)
 
-*Physiologically-Inspired Temporal Encoding & Curriculum Learning*
 
 [![License](https://img.shields.io/badge/license-Responsible%20AI-blue.svg)]()
 [![Python](https://img.shields.io/badge/python-3.8%2B-yellow.svg)]()
