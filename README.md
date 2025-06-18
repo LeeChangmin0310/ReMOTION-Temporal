@@ -89,14 +89,17 @@ If you use Windows or other operating systems, consider using [Windows Subsystem
 ## 📁 How to Cite
 
 ```bibtex
-@article{lee2025emotion,
-  title  = {Emotion Recognition from rPPG via Physiologically-Inspired Temporal Encoding and Attention-based Curriculum Learning},
-  author = {Lee, Changmin and Lee, Hyunwoo and Whang, Mincheol},
-  journal= {Sensors},
-  year   = {2025},
-  volume = {25},
-  number = {6},
-  pages  = {XXXX}
+@Article{s3658084,
+  AUTHOR = {Lee, Changmin and Lee, Hyunwoo and Whang, Mincheol},
+  TITLE  = {Emotion Recognition from rPPG via Physiologically-Inspired Temporal Encoding and Attention-based Curriculum Learning},
+  JOURNAL = {Sensors},
+  VOLUME = {25},
+  YEAR = {2025},
+  NUMBER = {},
+  ARTICLE-NUMBER = {},
+  URL = {},
+  ISSN = {1424-8220},
+  DOI = {}
 }
 ```
 
