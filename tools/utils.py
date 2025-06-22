@@ -167,7 +167,7 @@ class FocalLoss(nn.Module):
 # --- Utility function for straight-through Top-K attention ---
 def straight_through_topk(raw_scores: torch.Tensor, k: int, 
                           soft_branch: Literal["softmax", "entmax15", "entmax_alpha"] = "entmax_alpha", 
-                          st_alpha: float = 1.9):
+                          st_alpha: float = 1.5):
     """
     Forward : hard 1/0 Top-K mask
     Backward: soft probs (Entmax or Softmax) for gradient

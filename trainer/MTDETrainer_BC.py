@@ -1,196 +1,47 @@
 """
-
-rPPG → MTDE(encoder) → Chunk Embedding
-                      ↓
-               AttnScorer (raw score)
-                      ↓
-        ┌─────────────┴──────────────┐
-        │                            │
-   SupConLoss / ChunkCE         GatedPooling
-        ↓                            ↓
-    Representation             Session Embedding
-                                 ↓
-                         ClassificationHead
-
-
-Video session  →  N temporal chunks  ──▶  PhysMamba(extractor, frozen)
-                                         │  rPPG 1-D signal
-                                         ▼
-                                    MTDE(encoder)
-                                         │  chunk-embed z_t  (D=256)
-             ┌─────────────┬─────────────┴─────────────┐
-             │             │                           │
-      (Ph0) Projection  AttnScorer            (Ph2)   GatedPooling
-             │             │                           │
-     SupCon 128-dim   raw score s_t               session-embed Z_s
-             ▼             ▼                           ▼
-      SupConLoss       α-scheduler              Classifier(CE)
-                                 (Phase-specific heads)
-
-
-
-
-
-=======================================================
-🧠 Emotion Recognition Model - End-to-End Architecture
-=======================================================
-
-          rPPG Chunk (from PhysMamba)
-                        │
-                ┌──────▼─────────┐
-                │ MTDE(Encoder)  │ (Multi-Scale CNN → Embedding)
-                └──────┬─────────┘
-                       ▼
-              Chunk Embedding (B, D)
-                       │
-      ┌────────────────┴─────────────────┐
-      │                                  │
-      ▼                                  ▼
-AttnScorer (softmax/Top-K)      GatedPooling (CE path)
-      │                                  │
-Top-K + Threshold                      Session Embedding
-      │                                  │
- ┌────┴───────────┐                      ▼
- │               ▼               ClassificationHead
- │          ProjectionHead               │
- │               ↓                       ▼
- │           Normalize         CrossEntropyLoss (session-level)
- │               ↓                       │
- │       SupConLossTopK                  │
- │         (weight decays)               ▼
- │                \                    Logits
- │                 \
- ▼                  ▼
-TopKSoftPooling    ChunkAuxClassifier (per Top-K chunk)
-        │                   │
-  TopK Session Emb          └─ CE Loss (chunk-level, weak supervision)
-        ▼
-   KL AlignCosineLoss (pooled Top-K emb ↔ pooled Gated emb)
-
-=======================================================
-Summary:
-- Dual attention paths: AttnScorer (SupCon/TopK) vs GatedPooling (CE)
-- SupCon uses Top-K + projection (0–34 epoch), decays in importance
-- Weak CE via ChunkAuxClassifier using Top-K chunks (20–34)
-- GatedPooling guides main classifier via CE (30–49)
-- KL AlignCosineLoss between Top-K embeds vs Gated embeds (epoch 25–35)
-=======================================================
-
-
-═══════════════════════════════════════════════════════════════════════
-🔁 Emotion Recognition - Full Phase Description (by Epoch)
-═══════════════════════════════════════════════════════════════════════
-
-📌 Epoch 0–20: Exploration Phase
-───────────────────────────────
-rPPG Chunk → MTDE(encoder) → Chunk Embedding
+rPPG  →  MTDE (encoder)  →  chunk-embeddings
                          ↓
-                  AttnScorer (softmax, T=1.0)
+                    AttnScorer (raw scores)
                          ↓
-               Attention Weights (no Top-K)
-                         ↓
-         Weighted Projection → Normalize → SupConLossTopK
-                         ↓
-                 SparsityLoss (attention entropy)
+        ┌────────────┬────────────┐
+        │            │            │
+   SupConLoss    Chunk-CE*    GatedPooling
+        ↓            │              ↓
+   (Phase-0)     (Phase-1)    session-embedding
+                                        ↓
+                               ClassificationHead
+                                        ↓
+                           CrossEntropyLoss + (optional) SparsityLoss
 
-🟢 Active Modules:
-- MTDE(encoder), AttnScorer, ProjectionHead, SupConLossTopK
-- GatedPooling (from epoch 15) → only pooling, no CE
+*Chunk-CE = Focal-CE on Top-K chunks (Phase-1 only)
 
-❌ Frozen:
-- AlignLoss, Classifier, ChunkAuxClassifier
+========================= 50-Epoch Curriculum =========================
 
-🎯 Purpose:
-- Encourage diverse attention during early exploration
-- Learn global discriminative temporal representations
-- Avoid premature Top-K filtering
+PH-0  (Epoch 0–14)  –  Representation Exploration
+----------------------------------------------------------------------
+• SupConLossTopK over *all* chunks (α-softmax, no Top-K mask)
+• SparsityLoss(Entropy) warm-start λ = 0.05   → adaptive (≤ 0.20)
+• AttnScorer + ProjectionHead trainable
+• GatedPooling active (but CE weight = 0)
+• Classifier / ChunkAuxClassifier frozen
 
+PH-1  (Epoch 15–29) –  Chunk Discriminability
+----------------------------------------------------------------------
+• Top-K ratio 0.70 → 0.40  (linear)
+• Focal Chunk-CE weight 0.30 → 1.00  (first 4 epochs)
+• Session-level CE “cushion” weight = 0.20 (constant)
+• SupConLoss weight = 0.10  (still trains ProjectionHead)
+• GatedPooling / Classifier now trainable
 
-📌 Epoch 20–24: Top-K Supervision Phase
-────────────────────────────────
-AttnScorer → raw scores only
-Top-K + Threshold → selection
-
-┌── Top-K selected embeddings
-│      └→ Projection → Normalize → SupConLossTopK (lower weight)
-│      └→ ChunkAuxClassifier (chunk-level CE)
-│      └→ TopKSoftPooling (pooled embedding for KL later)
-▼
-GatedPooling → session embedding → Classifier (still frozen)
-
-🟠 Active Modules:
-- MTDE(encoder), AttnScorer, ProjectionHead
-- GatedPooling (from epoch 15)
-- ChunkAuxClassifier (weak CE, epoch 20–34)
-- SupConLossTopK (Top-K based, lower weight)
-- SparsityLoss (Attn entropy)
-
-❌ Frozen:
-- Classifier (session-level CE)
-- KL AlignLoss
-
-🎯 Purpose:
-- Begin weak CE supervision via Top-K chunks
-- Shift representation learning from contrastive to CE
-- Maintain sparse attention and chunk discriminability
-
-
-📌 Epoch 25–34: Alignment Phase
-───────────────────────────────
-TopKSoftPooling → TopK Session Embedding
-GatedPooling → Gated Session Embedding
-                         ↓
-         AlignCosineLoss (embedding vs embedding)
-                         ↓
-         Classifier (session-level CE)
-
-🔵 Active Modules:
-- Classifier (trainable)
-- SupConLossTopK (weight decaying)
-- GatedPooling, AlignCosineLoss
-- ChunkAuxClassifier
-
-🎯 Purpose:
-- Align dual attention pathways's representations (Top-K → Gated)
-- Transition to CE-dominant supervision
-
-
-📌 Epoch 35–44: Fine-Tuning Phase
-────────────────────────────────
-SupConLoss (fixed 0.05 or off)
-ProjectionHead, AttnScorer → frozen
-GatedPooling → Gated Embedding
-                ↓
-        Classifier → CrossEntropy
-
-🟣 Active Modules:
-- MTDE(encoder), GatedPooling, Classifier
-
-❄️ Frozen:
-- AttnScorer, ProjectionHead, SupConLossTopK (optionally off)
-- ChunkAuxClassifier (off after epoch 34)
-
-🎯 Purpose:
-- Refine CE classification accuracy
-- Final discriminative tuning
-
-
-📌 Epoch 45–49: Stability Phase
-───────────────────────────────
-    MTDE(encoder) → GatedPooling → Classifier → CE Loss
-
-⚪ Active Modules:
-- MTDE(encoder), GatedPooling, Classifier
-
-❌ Off:
-- SupConLossTopK, ChunkAuxClassifier, KL AlignLoss, AttnScorer, ProjectionHead
-
-🎯 Purpose:
-- Stable inference-ready attention + classifier
-- Final model generalization and consolidation
-
-═══════════════════════════════════════════════════════════════════════
+PH-2  (Epoch 30–49) –  Session-Level Fine-tune
+----------------------------------------------------------------------
+• SupConLoss OFF, Chunk-CE OFF
+• AttnScorer + ProjectionHead **frozen**
+• Classifier LR × 2 for first 6 epochs of PH-2
+• CE weight = 1.0 (only loss term)
+=======================================================================
 """
+
 
 import os
 import yaml
@@ -229,55 +80,29 @@ from modules.ChunkAuxClassifier import ChunkAuxClassifier
 from tools.utils import SupConLossTopK, FocalLoss
 from tools.utils import reconstruct_sessions, run_tsne_and_plot, straight_through_topk
 
-PHASE_BOUND = [15, 30]
+# ───────────────────────────────────────────────
+# TOP-LEVEL CURRICULUM  (50 epochs total)
+# Phase-0 :  0-14   ▶ SupCon (Softmax α=1.0)
+# Phase-1 : 15-29   ▶ Top-K + Chunk-CE (Focal)
+# Phase-2 : 30-49   ▶ Session-CE Fine-tune
+# ───────────────────────────────────────────────
+PHASE_BOUND = [15, 30]          # do not change elsewhere
 
 class MTDETrainer_BC(BaseTrainer):
     """
-    Session-Level Emotion Recognition Pipeline (MTDETrainer_BC)
-
-    ==============================================
-    🎯 Final Phase-based Training Strategy Overview
-    ==============================================
-    
-    PHASE 1: Epoch 0–19 — "Exploration"
-    - SupConLossTopK (attn-weighted all chunks)
-    - AttnScorer: softmax only
-    - ChunkAuxClassifier: off
-    - Classifier: off
-    - GatedPooling: on from epoch 15 (no CE)
-    - Purpose: representation diversity, soft attention adaptation
-
-    PHASE 2: Epoch 20–24 — "Top-K Transition"
-    - SupConLossTopK: Top-K + threshold, active
-    - ChunkAuxClassifier: on
-    - KL AlignLoss: off
-    - Purpose: sparse attention, Top-K selection, weak chunk-level CE
-
-    PHASE 3: Epoch 25–35 — "Alignment Phase"
-    - SupConLossTopK: Top-K, weight decays
-    - ChunkAuxClassifier: on
-    - AlignCosineLoss: active (TopK vs Gated embedding)
-    - Classifier: on
-    - Purpose: CE training + embedding alignment
-
-    PHASE 4: Epoch 36–44 — "Fine-tuning"
-    - CE only (Classifier, GatedPooling)
-    - SupConLossTopK: fixed at 0.05 (optional anchor)
-    - KL AlignLoss: T=1.0, optionally on
-    - Purpose: maximize CE accuracy
-
-    PHASE 5: Epoch 45–49 — "Stability"
-    - Only CE Loss
-    - All auxiliary paths off
-    - Purpose: clean & generalizable inference
-
-    Loss Composition:
-    + SupConLossTopK(selected_proj, label) × contrastive_weight
-    + CrossEntropyLoss(session_pred, label) × ce_weight
-    + Chunk-level CE (chunk_pred, label) × chunk_ce_weight
-    + SparsityLoss(attn_entropy) × sparsity_weight
+    Session-Level Emotion Recognition with 50-Epoch Curriculum
+    ==========================================================
+    Phase 0 (0-14):  Representation Exploration
+        - SupConLossTopK + entropy regularisation
+        - Classifier / ChunkAux frozen
+    Phase 1 (15-29): Chunk-level Refinement
+        - Top-K + Focal Chunk-CE  (+ small session-CE cushion)
+    Phase 2 (30-49): Session Fine-tune
+        - Only CE loss, MTDE+Pooling+Classifier train
+        - AttnScorer/Projection frozen, Classifier LR warm-boost
+    Loss = SupCon × w₁  + Focal Chunk-CE × w₂ + Session CE × w₃ + Entropy × λ
+    (w₁,w₂,w₃,λ are phase-dependent; see `update_training_state`)
     """
-
     def __init__(self, config, data_loader):
         super(MTDETrainer_BC, self).__init__()
         self.device = torch.device(config.DEVICE)
@@ -289,8 +114,8 @@ class MTDETrainer_BC(BaseTrainer):
         self.temperature = 1.0
         
         wandb.init(
-            project="TemporalReMOTION_MTDE_normalized",
-            name=f"Exp_Vlnc_3b_nogate",
+            project="ReMOTION_Temporal",
+            name=f"Exp_Arsl_50epochs",
             # config=cfg_dict,
             dir="./wandb_logs"
         )
@@ -341,7 +166,7 @@ class MTDETrainer_BC(BaseTrainer):
         # ------------------------------ Chunk Auxiliary Classifier -------------------------
         """Auxiliary classifier for weak chunk-level CE loss.
         Trained with session-level GT label per chunk and same structure with ClassificationHead"""
-        self.chunk_aux_classifier = ClassificationHead( # ChunkAuxClassifier(
+        self.chunk_aux_classifier = ChunkAuxClassifier(
             input_dim=config.MODEL.EMOTION.TEMPORAL_EMBED_DIM,
             num_classes=config.TRAIN.NUM_CLASSES
         ).to(self.device)
@@ -350,7 +175,9 @@ class MTDETrainer_BC(BaseTrainer):
         """Aggregates chunk embeddings to a session-level embedding using Gated self-attention
            Includes entropy regularization (used in sparsity loss)"""
         self.pooling = GatedPooling(
-            input_dim=config.MODEL.EMOTION.TEMPORAL_EMBED_DIM
+            input_dim=config.MODEL.EMOTION.TEMPORAL_EMBED_DIM,
+            p_drop=0.1,
+            fixed_alpha=1.5      # ← fixed α 
         ).to(self.device)
 
         # ----------------------------- Classification Head -----------------------------
@@ -359,13 +186,14 @@ class MTDETrainer_BC(BaseTrainer):
             input_dim=config.MODEL.EMOTION.TEMPORAL_EMBED_DIM,
             num_classes=config.TRAIN.NUM_CLASSES
         ).to(self.device)
+        self.logit_scale = nn.Parameter(torch.tensor(1, device=self.device) * 1.5)
 
         # ----------------------------- Chunk Forward Module ----------------------------
         self.chunk_forward_module = ChunkForwardModule(
             extractor=self.extractor.module,
             encoder=self.mtde,
             use_checkpoint=False,
-            freeze_extractor=True
+            freeze_extractor=True,
         ).to(self.device)
 
         # -------------------------------- Loss Functions -------------------------------
@@ -413,175 +241,150 @@ class MTDETrainer_BC(BaseTrainer):
         self.session_embeddings_for_tsne = []
         self.session_labels_for_tsne = []
     
-    def forward_chunk(self, chunk):
+    def forward_chunk(self, chunk, gate_on=True):
         """
         Forward pass for a single chunk.
         Args:
             chunk (Tensor): Input chunk tensor of shape (1, C, T, H, W)
+            gate_on : Phase0(True) / Phase1-2(False)
         Returns:
             emb (Tensor): Output embedding tensor of shape (1, embed_dim)
         """
-        return self.chunk_forward_module(chunk)
+        return self.chunk_forward_module(chunk, gate_on=gate_on)
     
-    def forward_single_chunk_checkpoint(self, chunk):
+    def forward_single_chunk_checkpoint(self, chunk, gate_on=True):
         """
         Forward pass a single chunk using the internal setting of use_checkpoint.
         """
         if self.chunk_forward_module.use_checkpoint:
-            return checkpoint.checkpoint(self.forward_chunk, chunk)
+            return checkpoint.checkpoint(self.forward_chunk, chunk, gate_on=gate_on)
         else:
-            return self.forward_chunk(chunk)
+            return self.forward_chunk(chunk, gate_on=gate_on)
         
-    def update_training_state(self, epoch):
+    # --------------------- Curriculum Phase Switch ---------------------
+    def update_training_state(self, epoch: int):
         """
-        Unified phase-aware training control:
-        - Sets loss weights, temperature, top-k ratio
-        - Controls gradient flow
-        - Configures optimizer/scheduler
-        Phase0 (0–14): SupCon + Entropy temp control
-        Phase1a (15–19): Chunk CE ramp-up + Top-K high
-        Phase1b (20–24): Chunk CE max + Top-K low
-        Phase1c (25–29): Chunk CE max + Session CE ramp-up
-        Phase2 (30–49): Session CE only + GatedPooling
-        """
+        Switches all hyper-parameters for each curriculum phase.
+        Phases: 0-14 | 15-29 | 30-49  (total 50 epochs)
         
-        # ───────────────────── Phase-0 ─────────────────────
-        if epoch < PHASE_BOUND[0]:                                                      # Phase-0   (0–14)
-            phase, lr, wd, t_max = 0, 3e-4, 1e-4, 15                                    # (= phase length × 1.0)
-            
-            self.contrastive_weight = max(0.4, 1.0 - 0.04 * epoch)                      # SupCon λ (diversity to sparsity) 
-            self.lambda_ent         = 0.1
+        -- Grad-gate per curriculum phase --------------------
+        • phase 0  : MTDE + Attn + Projection   (session modules OFF)
+        • phase 1a : ChunkAux only              (Top-K supervision)
+        • phase 1b : ChunkAux + Pool + Classifier (alignment stage)
+        • phase 2  : Pool + Classifier          (final CE fine-tune)
+        """
+        # -------- Phase-0: SupCon exploration ---------------------------------
+        if epoch < PHASE_BOUND[0]:
+            phase, base_lr, wd, t_max = 0, 3e-4, 1e-4, 15
+            self.contrastive_weight = 0.50
             self.chunk_ce_weight    = 0.0
-            self.top_k_ratio        = 0.0
             self.ce_weight          = 0.0
-            
-            # adaptive τ  (0.5 ≤ τ ≤ 1.2)
-            if self.avg_entropy_attn is None:
-                self.temperature = 1.0
-            else:
-                tau = 2.5 - self.avg_entropy_attn
-                self.temperature = max(0.7, min(1.2, tau))
-        
-        # ───────────────────── Phase-1 ─────────────────────
-        elif PHASE_BOUND[0] <= epoch < PHASE_BOUND[1]:        
+            self.top_k_ratio        = 0.0
+
+            # ▸ Phase-0 starts with *mild* entropy regularisation (0.05)
+            #   and will be updated online after each epoch.
+            self.lambda_ent         = 0.05
+
+        # -------- Phase-1: Top-K + Chunk-CE -----------------------------------
+        elif epoch < PHASE_BOUND[1]:
             phase = 1
-            sub = epoch - PHASE_BOUND[0]  # 0…14
+            sub   = epoch - PHASE_BOUND[0]            # 0‥14
+            base_lr, wd, t_max = 2e-4, 5e-4, 15
 
-            # Base lr/wd/t_max for Phase1
-            lr, wd, t_max = 2e-4, 5e-4, 15
-            self.contrastive_weight = 0.0
+            self.top_k_ratio        = 0.70 - 0.30 * (sub / 14)
+            self.chunk_ce_weight    = 0.30 if sub < 4 else 1.0
+            self.ce_weight          = 0.20            # constant cushion
+            self.contrastive_weight = 0.10
             self.lambda_ent         = 0.0
-            self.chunk_ce_weight    = 0.0
-            self.top_k_ratio        = 0.0
-            self.ce_weight          = 0.0
-            self.temperature        = 1.0
 
-            # ─── Phase1a ─── epochs 15–19 ───
-            if sub < 5:
-                # chunk CE: 0.5→1.0 over 5 epochs
-                self.chunk_ce_weight = 0.5 + sub * (0.5/5)
-                # Top-K: 0.6→0.5
-                self.top_k_ratio     = 0.6 - sub * (0.1/5)
-                self.ce_weight       = 0.0
+        # -------- Phase-2: Session-CE fine-tune -------------------------------
+        else:
+            phase, base_lr, wd, t_max = 2, 1e-4, 1e-4, 20
+            self.top_k_ratio = self.contrastive_weight = self.chunk_ce_weight = 0.0
+            self.ce_weight   = 1.0
+            self.lambda_ent  = 0.0
 
-            # ─── Phase1b ─── epochs 20–24 ───
-            elif sub < 10:
-                self.chunk_ce_weight = 1.0
-                # Top-K: 0.5→0.3 over next 5 epochs
-                self.top_k_ratio     = 0.5 - (sub-5) * (0.2/5)
-                self.ce_weight       = 0.0
+        # ────────────────── requires_grad scheduler ──────────────────
 
-            # ─── Phase1c ─── epochs 25–29 ───
-            else:
-                self.chunk_ce_weight = 1.0
-                self.top_k_ratio     = 0.3
-                self.ce_weight       = (sub-10) * (0.5/5)                               # 0 → 0.5 over 5 epochs (cushion)
-        
-        # ───────────────────── Phase-2 ─────────────────────
-        elif epoch >= PHASE_BOUND[1]:                          
-            phase, lr, wd, t_max    = 2, 1e-3, 2e-4, 20                                 # (= 15 × 1.0)
-            self.lambda_ent         = 0.0
-            self.contrastive_weight = 0.0
-            self.chunk_ce_weight    = 0.0
-            self.top_k_ratio        = 0.0
-            self.ce_weight          = min(1.0, 0.5 + 0.02 * (epoch - PHASE_BOUND[1]))   # 0.5 → 1.0
-            self.temperature        = 1.0
-            
-            # copy chunk_aux → session-level classifier
-            if epoch == PHASE_BOUND[1]:
-                self.classifier = deepcopy(self.chunk_aux_classifier.train())
-            
-        # ─────── Gradient gate ───────
-        for p in self.attn_scorer.parameters():
-            p.requires_grad = True
-        for p in self.mtde.parameters():
-            p.requires_grad = True
-        for p in self.chunk_projection.parameters():
-            p.requires_grad = (phase == 0)
-        for p in self.chunk_aux_classifier.parameters():
-            p.requires_grad = (phase == 1)
-        for p in self.pooling.parameters():
-            p.requires_grad = (phase == 2) or (phase == 1 and epoch - PHASE_BOUND[0] >= 10)
-        for p in self.classifier.parameters():
-            p.requires_grad = (phase == 2)
+    
+        sub  = epoch - PHASE_BOUND[0]            # 0‥14 in Phase-1
+        p1b  = (phase == 1 and sub >= 10)        # alignment window
 
-        # Reconfigure optimizer/scheduler per phase
-        frozen = self.configure_optimizer_scheduler(lr, wd, t_max, phase)
-        
-        # SupConLoss sampling scheduling (e.g., threshold, top-k mask, etc.)
+        def set_grad(module, flag: bool):
+            for p in module.parameters():
+                p.requires_grad = flag
+
+        # ── MTDE encoder (always trainable) ──────────────────────────
+        set_grad(self.mtde, True)
+
+        # ── Attention-Scorer ─────────────────────────────────────────
+        set_grad(self.attn_scorer, phase < 2)         # freeze at Phase-2
+
+        # ── Projection head (SupCon only) ───────────────────────────
+        set_grad(self.chunk_projection, phase == 0)
+
+        # ── Chunk-level auxiliary classifier ────────────────────────
+        set_grad(self.chunk_aux_classifier, phase == 1)
+
+        # ── Gated-Pooling + Session-Classifier ──────────────────────
+        set_grad(self.pooling,     p1b or phase == 2)
+        set_grad(self.classifier,  p1b or phase == 2)
+
+
+        # ------------- rebuild optimizer when phase changes -------------------
+        if getattr(self, 'cur_phase', -1) != phase:
+            self.cur_phase = phase
+            frozen = self.configure_optimizer_scheduler(base_lr, wd, t_max, phase, epoch)
+        else:
+            frozen = []
+
+        # SupCon internal scheduling (pos / neg budget)
         self.contrastive_loss_fn.schedule_params(epoch, self.max_epoch)
-        
+
         return phase, frozen
 
-    def configure_optimizer_scheduler(self, lr, weight_decay, t_max, phase):
+
+    # ------------------ Optimizer / Scheduler builder ------------------------
+    def configure_optimizer_scheduler(self, base_lr, weight_decay, t_max,
+                                    phase: int, epoch: int):
         """
-        Phase-wise optimizer & scheduler setup.
-        Automatically resets learning rate and weight decay per phase.
-
-        * phase 0 : AttnScorer LR = 1.00 × lr
-        * phase 1 : AttnScorer LR = 1.00 × lr   
-        * phase 2 : AttnScorer LR = 0.50 × lr   (fine-tuning)
+        Creates AdamW param-groups with per-module LR.
+        Classifier receives ×2 LR for the first six epochs of Phase-2.
         """
-        # ------------------------------------------------------------------
-        lr_scale_as = 1.0 if phase < 2 else 0.5
-        lr_raw      = lr                     # default lr per phase
-        lr_as       = lr * lr_scale_as       # lr for AttnScorer
-        # ------------------------------------------------------------------
+        # -------- classifier LR warm-up (Phase-2)
+        cls_boost = 2.0 if (phase == 2 and (epoch - PHASE_BOUND[1]) < 6) else 1.0
+        lr_cls    = base_lr * cls_boost
 
-        pg_decay, pg_nodecay, frozen = [], [], []
+        pg_decay, pg_nd, frozen = [], [], []
 
-        def add_param(param, name, lr_this):
-            is_nd = ("bias" in name or "LayerNorm" in name)
-            group  = pg_nodecay if is_nd else pg_decay
-            group.append(
-                {"params": param,
-                "lr": lr_this,
-                "weight_decay": 0.0 if is_nd else weight_decay}
-            )
+        def add_param(p, name, lr):
+            group = pg_nd if 'bias' in name else pg_decay
+            group.append({'params': p, 'lr': lr,
+                        'weight_decay': 0.0 if 'bias' in name else weight_decay})
 
-        # --------- params setup ---------
         modules = [
-            (self.mtde,                lr_raw),
-            (self.attn_scorer,         lr_as),
-            (self.pooling,             lr_raw),
-            (self.chunk_projection,    lr_raw),
-            (self.chunk_aux_classifier,lr_raw),
-            (self.classifier,          lr_raw),
+            ("MTDE",                 self.mtde,                 base_lr),
+            ("AttnScorer",           self.attn_scorer,          base_lr),
+            ("Pooling",              self.pooling,              base_lr),
+            ("ChunkProj",            self.chunk_projection,     base_lr),
+            ("ChunkAux",             self.chunk_aux_classifier, base_lr),
+            ("Classifier",           self.classifier,           lr_cls),
         ]
-
-        for module, lr_mod in modules:
-            for n, p in module.named_parameters():
+        for tag, module, lr_mod in modules:        # tag = str prefix
+            for pname, p in module.named_parameters():
+                full_name = f"{tag}.{pname}"        # ← prefix 
                 if not p.requires_grad:
-                    frozen.append(n)
+                    frozen.append(full_name) 
                     if p.grad is not None:
                         p.grad = None
                     continue
-                add_param(p, n, lr_mod)
-
-        # --------- Optimizer / Scheduler ---------
-        self.optimizer = optim.AdamW(pg_decay + pg_nodecay)
-        # self.scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(self.optimizer, T_0=t_max, T_mult=2, eta_min=1e-6)
-        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=t_max, eta_min=1e-6)
+                add_param(p, full_name, lr_mod)
+        
+        self.optimizer = optim.AdamW(pg_decay + pg_nd, betas=(0.9, 0.95))
+        self.scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            self.optimizer, T_0=t_max, T_mult=2, eta_min=5e-6)
+        # self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=t_max, eta_min=1e-6)
+        
         return frozen
     
     # ----------------------------------------------------------
@@ -591,26 +394,20 @@ class MTDETrainer_BC(BaseTrainer):
 
     def forward_batch(self, batch, epoch, phase):
         """
-        One mini-batch forward pass (B sessions).
-        Handles phase-wise:
-        - Phase 0: SupConLossTopK + adaptive temperature
-        - Phase 1: Chunk-level CE with Top-K + threshold
-        - Phase 2: Session-level CE with GatedPooling
-        
-        Handles:
-        - MTDE(encoder) → chunk-wise rPPG embeddings
-        - AttnScorer: pre-softmax raw score
-        - SupConLossTopK with Top-K + threshold selection from epoch ≥ 20
-        - GatedPooling for CE loss
-        - ChunkAuxClassifier (epoch 20–34 only) for chunk-level CE supervision
-        - SparsityLoss based on entropy: AttnScorer vs Gated
-        - t-SNE logging for chunk/session visualization
-        - Full debug printouts for embeddings, attention, entropy, losses
-        
-        Additional:
-        - t-SNE logging
-        - Attention entropy debug
-        - Full loss composition & debug prints
+        Mini-batch forward pass.
+
+        Phase 0 : SupConLossTopK + SparsityLoss
+        Phase 1 : Top-K → Focal Chunk-CE  (+ small session-CE cushion)
+        Phase 2 : GatedPooling → Session-CE (Classifier warm-up scale)
+
+        Core steps
+        ----------
+        1) rPPG → MTDE → chunk-embeddings
+        2) AttnScorer → raw scores (+ α-entmax soft weights)
+        3) Phase-specific losses:
+        • SupCon (P0) • Chunk-CE (P1) • Session-CE (P1 cushion & P2 full)
+        4) GatedPooling always produces session embedding
+        5) Extensive debug print / t-SNE logging
         """
         chunk_tensors, batch_labels, batch_sids, _ = batch
         B = len(batch_labels)
@@ -632,7 +429,8 @@ class MTDETrainer_BC(BaseTrainer):
             print(f"[DEBUG] Session {sid}  #chunks={T}")
 
             # 1) Extract rPPG and its embeddings of all chunks at once (T,1,128) ➜ (1,T,D)
-            chunk_emb = self.forward_single_chunk_checkpoint(chunks)                                    # (T,D)
+            gate_flag = (phase == 0)
+            chunk_emb = self.forward_single_chunk_checkpoint(chunks, gate_on=gate_flag)                                    # (T,D)
             chunk_emb = chunk_emb.unsqueeze(0)                                                          # (1,T,D)
             
             # ──────── per-chunk debug & t-SNE ───────────────
@@ -769,7 +567,13 @@ class MTDETrainer_BC(BaseTrainer):
         # Session CE (always computed)
         sess_mat   = torch.stack(session_embeds, 0)
         label_vec  = torch.tensor(target_labels, dtype=torch.long, device=self.device)
-        ce_logits  = self.classifier(sess_mat)
+        logits_raw  = self.classifier(sess_mat)
+        if phase == 2:
+            # gently raise scale within Phase-2
+            scale_factor = 1.5 + 0.5 * min((epoch - PHASE_BOUND[1]) / 19, 1.0)
+            ce_logits = self.logit_scale * scale_factor * logits_raw
+        else:                       
+            ce_logits = logits_raw.detach() + logits_raw - logits_raw.detach()
         ce_loss    = self.criterion(ce_logits, label_vec)
 
         # ───── scaled terms (for debug table) ───────────────
@@ -851,25 +655,12 @@ class MTDETrainer_BC(BaseTrainer):
 
     def train(self, data_loader):
         """
-        Training loop with full phase-aware scheduling:
-        - Adaptive loss weights
-        - Adaptive temperature & threshold based on entropy
-        - Phase-dependent gradient flow and Top-K usage
-        - Debug info for loss weights, gradients, and prediction breakdown
-        
-        Main training loop for session-level emotion classification using:
-        🔁 Pipeline:
-        - MTDE(encoder) extracts chunk-wise rPPG embeddings
-        - AttnScorer assigns attention scores (softmax → entmax → raw score)
-        - Top-K + threshold selection for contrastive learning (SupConLossTopK)
-        - GatedPooling aggregates session embeddings (used for CE)
-        - Classifier makes session-level predictions
-
-        🎯 Multi-phase Loss Scheduling:
-        - SupConLossTopK: early exploration → Top-K-based → frozen
-        - CE Loss: ramp-up during phase 2 → dominant in later epochs
-        - SparsityLoss: attention entropy regularization
-        - ChunkAuxClassifier: weak CE on Top-K chunks (epoch 20–34)
+        Curriculum-aware training loop
+        --------------------------------
+        • Updates loss weights, Top-K ratio, sparsity λ each epoch
+        • Dynamically freezes / unfreezes modules per phase
+        • Classifier LR × 2 warm-boost during first 6 epochs of Phase-2
+        • Logs gradients, entropies, t-SNE plots, and saves best checkpoints
         """
         torch.autograd.set_detect_anomaly(True)
         
@@ -982,6 +773,14 @@ class MTDETrainer_BC(BaseTrainer):
             avg_entropy_gated = sum(entropy_gated_all) / len(entropy_gated_all)
             self.avg_entropy_attn = avg_entropy_attn
             
+            # ───────────────────────────────────────────────────
+            # Adaptive sparsity weight (Phase-0 only)
+            if phase == 0:
+                target_H  = 1.10                      # desired entropy (bits)
+                gap       = max(0.0, target_H - avg_entropy_attn)
+                self.lambda_ent = 0.05 + 0.15 * gap   # 0.05 – 0.20
+            # ───────────────────────────────────────────────────
+            
             # === Training summary ===
             avg_loss = running_loss / num_batches
             acc = accuracy_score(all_labels, all_preds)
@@ -1043,17 +842,22 @@ class MTDETrainer_BC(BaseTrainer):
                 print(f"[SAVE] Final model saved at last epoch {epoch}")
             
             wandb.log({
-                "loss/train_total": avg_loss,
                 "loss/train_ce": self.loss_ce_per_epoch[-1],
+                "loss/train_total": avg_loss,
+                "loss/valid_total": val_loss,
+                
                 "loss/train_contrastive": self.loss_contrastive_per_epoch[-1],
                 "loss/train_sparsity": self.loss_sparsity_per_epoch[-1],
                 "loss/train_chunk_ce": self.loss_chunk_ce_per_epoch[-1],
-                "acc/train": acc,
-                "loss/valid_total": val_loss,
+                
                 "acc/valid": metrics["accuracy"],
                 "f1/valid": metrics["f1"],
-                "entropy/attn": avg_entropy_attn,
+                "acc/train": acc,
+                
                 "entropy/gated": avg_entropy_gated,
+                "entropy/attn": avg_entropy_attn,
+                "lambda_ent": self.lambda_ent,
+                
                 "lr": self.scheduler.get_last_lr()[0],
                 "epoch": epoch
             })
@@ -1149,7 +953,7 @@ class MTDETrainer_BC(BaseTrainer):
 
         for tag in tags:
             #"""
-            model_path = os.path.join("./saved_models/6604", f"{base_name}_{tag}.pth")
+            model_path = os.path.join("./saved_models", f"{base_name}_{tag}.pth")
             if not os.path.exists(model_path):
                 print(f"[SKIP] {tag} model not found at {model_path}")
                 continue
@@ -1299,12 +1103,12 @@ class MTDETrainer_BC(BaseTrainer):
         """
         checkpoint = torch.load(path, map_location=self.device)
         
-        self.mtde.load_state_dict(checkpoint["mtde"])
-        self.attn_scorer.load_state_dict(checkpoint["attn_scorer"])
-        self.chunk_projection.load_state_dict(checkpoint["projection_head"])
-        self.chunk_aux_classifier.load_state_dict(checkpoint["chunk_aux_classifier"])
-        self.pooling.load_state_dict(checkpoint["gated_pooling"])
-        self.classifier.load_state_dict(checkpoint["classifier"])
+        self.mtde.load_state_dict(checkpoint["mtde"], strict=False)
+        self.attn_scorer.load_state_dict(checkpoint["attn_scorer"], strict=False)
+        self.chunk_projection.load_state_dict(checkpoint["projection_head"], strict=False)
+        self.chunk_aux_classifier.load_state_dict(checkpoint["chunk_aux_classifier"], strict=False)
+        self.pooling.load_state_dict(checkpoint["gated_pooling"], strict=False)
+        self.classifier.load_state_dict(checkpoint["classifier"], strict=False)
         
         print(f"[LOAD] Best model loaded from: {path}")
 

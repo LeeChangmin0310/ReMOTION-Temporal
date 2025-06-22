@@ -1,94 +1,67 @@
- ###################################################
-# Attention Scorer
-###################################################
+###############################################################
+# 1) AttnScorer – entropy-aware scaling + smoother α-schedule
+###############################################################
+import torch, entmax, torch.nn as nn, torch.nn.functional as F
 
-import torch
-import entmax
-import torch.nn as nn
-import torch.nn.functional as F
 
 class AttnScorer(nn.Module):
-    """
-    AttnScorer is a lightweight attention module designed to score temporal chunks
-    based on their relevance to the emotion classification task.
-    
-    The scores are typically used for selecting Top-K chunks per session for 
-    supervised contrastive learning (SupConLossTopK).
+    """Two-layer MLP → scalar score per chunk.
+    Kernel schedule:
+        • P0  (0-14) :   softmax   (exploration)
+        • P1  (15-29):   α-entmax  α 1.0→1.4  (sparsity ramp)
+        • P2  (≥30) :   raw logits (hand off to GatedPooling)
     """
 
-    def __init__(self, input_dim):
-        """
-        Initializes the attention scorer module.
-
-        Args:
-            input_dim (int): The dimensionality of each chunk embedding (D).
-            temperature (float): Temperature scaling factor for softmax sharpness.
-        """
+    def __init__(self, input_dim: int):
         super().__init__()
-
-        # The scorer is a 2-layer feedforward network with Tanh activation in between.
-        # It compresses the D-dimensional input to a single scalar score per chunk.
         self.scorer = nn.Sequential(
-            nn.Linear(input_dim, input_dim // 2),  # Reduces dimension
-            nn.GELU(),                             # smoother, no saturation
-            # nn.Tanh(),                             # Non-linear activation
-            nn.Linear(input_dim // 2, 1)           # Outputs a scalar score
+            nn.Linear(input_dim, input_dim // 2),
+            nn.GELU(),
+            nn.Linear(input_dim // 2, 1)
         )
-        # -------- running std (EMA) buffer registering --------
+        # Running std-dev of raw scores (EMA) for dynamic scaling
         self.register_buffer("running_score_std", torch.tensor(1.0))
 
+    # ---------- helpers ----------
     @torch.no_grad()
-    def _update_running_std(self, batch_std):
+    def _update_running_std(self, batch_std: float):
+        # EMA: 0.9·prev + 0.1·new
         self.running_score_std.mul_(0.9).add_(0.1 * batch_std)
-    
-    def forward(self, z, temperature=0.5, epoch=0):
+
+    # ---------- forward ----------
+    def forward(self, z: torch.Tensor,
+                temperature: float = 1.0,
+                epoch: int = 0):
         """
-        Args:
-            z (Tensor): (B, T, D) chunk embeddings
-            return_entropy (bool): whether to return entropy
-
-        Returns:
-            attn_weights (Tensor): (B, T, 1)
-            entropy (optional): scalar tensor for entropy loss
-            running_score_std (float): running std of raw attention scores
-                                        (EMA for std-aware adaptive temperature adjustment)
+        z : (B, T, D)
+        Returns: attn (or None), scaled_logits, alpha
         """
-        # 1) zero-mean raw scores
-        scores     = self.scorer(z)                           # (B,T,1)
-        raw_scores = scores - scores.mean(1, keepdim=True)    # zero-mean
+        scores = self.scorer(z)                            # (B,T,1)
+        scores = scores - scores.mean(1, keepdim=True)     # zero-mean
 
-        # 2) EMA σ  update
-        self._update_running_std(raw_scores.detach().std().item())
-        sigma = self.running_score_std.item()
+        # --- adaptive scale  -----------------------------------------
+        batch_std = scores.detach().std().item()
+        self._update_running_std(batch_std)
+        sigma = max(self.running_score_std.item(), 1e-4)
+        gamma = max(0.6, min(1.6, 0.9 / sigma))            # target σ* ≈0.9
+        scaled = scores * gamma
 
-        sigma_star = 0.8 if epoch < 12 else 1.2               # target σ*
-        gamma      = (sigma_star / (sigma + 1e-4))
-        gamma      = float(max(0.5, min(2.0, gamma)))         # clamp
-        raw_scaled = raw_scores * gamma                       # scale
-        alpha = None
-        
-        # --- choose attention kernel ----------------------
+        # --- kernel switch  ------------------------------------------
+        attn, alpha = None, None
         if self.training:
-            if epoch < 15:                                                      # Phase 0:  Softmax diversity explore
-                attn = torch.softmax(raw_scaled / temperature, dim=1)
-            
-            elif 15 <= epoch < 30:                                              # Phase 1:  α-Entmax discriminativity explore                   
-                if epoch < 20:                                                      # Phase-1a
-                    alpha = 1.0 + 0.3 * ((epoch - 15) / 5)                              # 1.0 → 1.3
-                elif epoch < 25:                                                    # Phase-1b
-                    alpha = 1.3 + 0.3 * ((epoch - 20) / 5)                              # 1.3 → 1.6
-                elif epoch < 30:                                                    # Phase-1c
-                    alpha = 1.7                                                         # 1.7
-                attn = entmax.entmax_bisect(raw_scaled, alpha=alpha, dim=1)         # (B,T)
-                
-            else:                                                               # Phase 2:    scorer fine-tune
-                attn  = None                                                          # use raw_scores only
-        else:
-            attn = entmax.entmax_bisect(raw_scaled, alpha=1.5, dim=1)
-            
-        # 4) DEBUG
-        if self.training and (torch.rand(1).item() < 0.05):   # 5 % debug
-            print(f"[AttnScorer] epoch={epoch:02d} | σ={sigma:.3f} "
-                  f"→ γ={gamma:.2f} | kernel={('soft','α','15','raw')[min(3,epoch//15)]}")
+            if epoch < 15:                                 # Phase-0
+                attn = torch.softmax(scaled / temperature, dim=1)
+            elif epoch < 30:                               # Phase-1
+                sub   = epoch - 15       # 0‥14
+                alpha = 1.0 + 0.4 * (sub / 14)             # 1.0→1.4
+                attn  = entmax.entmax_bisect(scaled, alpha=alpha, dim=1)
+            # Phase-2 : attn=None → raw logits only
+        else:                                              # inference
+            attn = entmax.entmax15(scaled, dim=1)
 
-        return attn, raw_scaled, alpha
+        # --- debug (5 % chance) ---------------------------
+        if self.training and torch.rand(1).item() < 0.05:
+            ker = "soft" if epoch < 15 else ("ent" if epoch < 30 else "raw")
+            print(f"[Attn] ep:{epoch:02d} γ:{gamma:.2f} ker:{ker}")
+
+        return attn, scaled, alpha

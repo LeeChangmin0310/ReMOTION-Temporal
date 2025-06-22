@@ -1,3 +1,173 @@
+# =============================================================
+# Physio-TriScale MTDE  (3-branch RF = 5 / 49 / 113  +  Softmax-Gate pool)
+# =============================================================
+import torch, torch.nn as nn, torch.nn.functional as F
+
+# -------------------------------------------------------------
+# 1.  Softmax-over-time  +  optional channel-wise sigmoid gate
+# -------------------------------------------------------------
+class SoftmaxGatePool(nn.Module):
+    """
+    Temporal soft-attention followed by an optional per-channel gate.
+    Args
+    ----
+    C : int
+        Number of input channels.
+    """
+    def __init__(self, C: int):
+        super().__init__()
+        # 1×1 convolution to predict a scalar attention score per time step
+        self.attn = nn.Conv1d(C, 1, kernel_size=1)
+        # Linear layer to produce a channel-wise gating vector
+        self.gate = nn.Linear(C, C)
+
+    def forward(self, x: torch.Tensor, gate_on: bool = True) -> torch.Tensor:
+        """
+        Parameters
+        ----------
+        x : Tensor, shape (B, C, T)
+            Input feature map.
+        gate_on : bool
+            If True, applies the channel gate (Phase-0 diversity);  
+            if False, passes pooled vector as is (Phase-1/2 to avoid overlap
+            with AttnScorer).
+
+        Returns
+        -------
+        Tensor, shape (B, C)
+            Pooled (and optionally gated) representation.
+        """
+        # Temporal attention weights, softmax normalized along time axis
+        w = torch.softmax(self.attn(x), dim=-1)           # (B, 1, T)
+        pooled = (x * w).sum(dim=-1)                      # (B, C)
+        if gate_on:                                       # channel-wise gating
+            pooled = pooled * torch.sigmoid(self.gate(pooled))
+        return pooled                                     # (B, C)
+
+# -------------------------------------------------------------
+# 2.  Multi-scale temporal block : RF 5 / 49 / 113 frames
+# -------------------------------------------------------------
+def same_conv(cin: int, cout: int, k: int, d: int) -> nn.Conv1d:
+    """
+    Length-preserving 1-D convolution.
+    Padding = (k-1)*d/2 keeps output length equal to input length.
+    """
+    pad = int((k - 1) * d / 2)
+    return nn.Conv1d(cin, cout, kernel_size=k, padding=pad, dilation=d)
+
+class MultiScaleTemporalBlock(nn.Module):
+    """
+    Three-branch temporal encoder targeting physiologically meaningful
+    receptive fields (RF):
+        Short  — 5  frames  (~0.15 s, pulse upslope)
+        Mid    — 49 frames  (~1.6  s, sympathetic HRV burst)
+        Long   — 113 frames (~3.7 s, parasympathetic / affective tone)
+    """
+    def __init__(self, Cin: int = 24, emb_dim: int = 256, dropout: float = 0.1):
+        super().__init__()
+        # --- Short branch ---------------------------------------------------
+        self.br_short = nn.Sequential(
+            same_conv(Cin, 16, k=3, d=2),     # RF = 5
+            nn.GELU(),
+            nn.MaxPool1d(2)
+        )
+        # --- Mid branch -----------------------------------------------------
+        self.br_mid = nn.Sequential(
+            same_conv(Cin, 32, k=5, d=12),    # RF = 49
+            nn.GELU(),
+            nn.MaxPool1d(2)
+        )
+        # --- Long branch ----------------------------------------------------
+        self.br_long = nn.Sequential(
+            same_conv(Cin, 40, k=3, d=56),    # RF = 113
+            nn.GELU(),
+            nn.MaxPool1d(2)
+        )
+
+        self.C_total = 16 + 32 + 40           # 88 channels
+        self.norm  = nn.GroupNorm(8, self.C_total)  # 8 groups × 11 ch
+        self.drop  = nn.Dropout(dropout)
+        self.pool  = SoftmaxGatePool(self.C_total)
+        self.proj  = nn.Linear(self.C_total, emb_dim)
+
+    def forward(self, x: torch.Tensor, gate_on: bool = True) -> torch.Tensor:
+        """
+        x : Tensor, shape (B, C, T)
+        gate_on : bool, passed to SoftmaxGatePool.
+        """
+        # Concatenate branch outputs along channel dimension
+        cat = torch.cat([
+            self.br_short(x),
+            self.br_mid  (x),
+            self.br_long (x)
+        ], dim=1)                                    # (B, 88, T′)
+
+        cat = self.drop(self.norm(cat))
+        pooled = self.pool(cat, gate_on=gate_on)     # (B, 88)
+        return F.gelu(self.proj(pooled))             # (B, emb_dim)
+
+# -------------------------------------------------------------
+# 3.  Slim Stem  (Conv5 → Conv3 stride-2) : local pulse feature extractor
+# -------------------------------------------------------------
+class SlimStem(nn.Sequential):
+    """
+    Two-layer stem:
+        1) Conv-5 captures local upslope curvature.
+        2) Conv-3 stride-2 performs learnable down-sampling to T/2.
+    """
+    def __init__(self, Cin: int = 1, Cout: int = 24, drop: float = 0.1):
+        super().__init__(
+            nn.Conv1d(Cin, Cout, kernel_size=5, padding=2),
+            nn.GroupNorm(4, Cout),
+            nn.GELU(),
+            nn.Conv1d(Cout, Cout, kernel_size=3, padding=1, stride=2),
+            nn.Dropout(drop)
+        )
+
+# -------------------------------------------------------------
+# 4.  Full MTDE encoder
+# -------------------------------------------------------------
+class MTDE(nn.Module):
+    """
+    End-to-end encoder:
+        128-frame rPPG chunk  →  256-D embedding
+    """
+    def __init__(self,
+                 in_channels:   int = 1,
+                 cnn_out:       int = 24,
+                 embedding_dim: int = 256,
+                 dropout_rate:  float = 0.1):
+        super().__init__()
+        self.stem = SlimStem(in_channels, cnn_out, dropout_rate)
+        self.mstb = MultiScaleTemporalBlock(cnn_out, embedding_dim, dropout_rate)
+        self.apply(self._init_weights)
+
+    @staticmethod
+    def _init_weights(m):
+        if isinstance(m, (nn.Conv1d, nn.Linear)):
+            nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+
+    def forward(self, x: torch.Tensor, gate_on: bool = True) -> torch.Tensor:
+        """
+        Parameters
+        ----------
+        x : (B, T) or (B, T, 1)
+            Raw rPPG chunk (length 128).
+        gate_on : bool
+            Controls channel gate in SoftmaxGatePool.
+            Set True during Phase-0 (contrastive), False afterwards.
+        """
+        # Ensure shape (B, 1, T)
+        if x.dim() == 2:
+            x = x.unsqueeze(1)               # (B, 1, T)
+        elif x.shape[2] == 1:
+            x = x.transpose(1, 2)            # (B, 1, T)
+
+        z = self.stem(x)                     # (B, C, T/2 = 64)
+        return self.mstb(z, gate_on=gate_on) # (B, embedding_dim)
+
 '''
 # =============================================================
 # Slim‑MTDE (4‑Branch, Physiology‑tuned)
@@ -89,6 +259,7 @@ class MTDE(nn.Module):
         return self.mstb(self.stem(x))
 
 '''
+'''
 # =============================================================
 # Slim‑MTDE  (3‑branch RF = 6 / 60 / 120  +  Softmax‑Gate pool)
 # =============================================================
@@ -125,17 +296,17 @@ def same_conv(Cin, Cout, k, d):
 class MultiScaleTemporalBlock(nn.Module):
     def __init__(self, Cin=24, emb_dim=256, dropout=0.2):
         super().__init__()
-        # Short  RF = 3 (Conv)  -> 6 after MaxPool
+        # Short  RF = 5 (Conv)  -> 6 after MaxPool
         self.br_short = nn.Sequential(
-            same_conv(Cin, 16, k=3, d=1),
+            same_conv(Cin, 16, k=3, d=2),
             nn.GELU(), nn.MaxPool1d(2)
         )
-        # Medium RF = 29 -> 58 (≈2 s)
+        # Medium RF = 61 (≈2 s)
         self.br_mid = nn.Sequential(
-            same_conv(Cin, 24, k=5, d=15),
+            same_conv(Cin, 24, k=3, d=30),
             nn.GELU(), nn.MaxPool1d(2)
         )
-        # Long   RF = 121 -> 242 (covers whole 128‑frame chunk)
+        # Long   RF = 121 (≈4 s)
         self.br_long = nn.Sequential(
             same_conv(Cin, 32, k=3, d=60),
             nn.GELU(), nn.MaxPool1d(2)
@@ -196,7 +367,7 @@ class MTDE(nn.Module):
             x = x.transpose(1, 2)         # (B,1,T)
         z = self.stem(x)                  # (B,C,T/2)
         return self.mstb(z)               # (B, emb_dim)
-
+'''
 '''
 # =============================================
 # MTDEv13: Optimized Multi-Scale Temporal Dynamics Encoder

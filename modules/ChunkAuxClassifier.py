@@ -1,56 +1,43 @@
-#############################################
-# ChunkAuxClassifier: 
-#  An auxiliary classifier for chunk-level CE loss
-#############################################
-
+# ===============================================
+# Lightweight auxiliary classifier for chunk CE
+# ===============================================
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
 class ChunkAuxClassifier(nn.Module):
     """
-    ChunkAuxClassifier (Auxiliary Classifier for Chunk-level CE Loss)
-
-    Purpose:
-        - Provide auxiliary supervision at the chunk level using session-level GT labels
-        - Guide the TemporalBranch to learn discriminative embeddings even before full session aggregation
-        - Used only during ramp-up phase (e.g., epoch 20~34)
-
-    Input:
-        - x: Tensor of shape (B, D) or (B, T, D), where T is the number of chunks
-
-    Output:
-        - logits: Tensor of shape (B, C) or (B * T, C), for classification
+    Chunk-level auxiliary head.
+    Only used during Phase-1 to provide weak CE on Top-K chunks.
     """
-    def __init__(self, input_dim, num_classes, hidden_dim=64, dropout=0.3):
+    def __init__(self,
+                 input_dim: int,
+                 num_classes: int,
+                 hidden_dim: int = 48,
+                 p_drop: float = 0.25):
         super().__init__()
-        self.aux_classifier = nn.Sequential(
+
+        self.net = nn.Sequential(
             nn.LayerNorm(input_dim),
             nn.Linear(input_dim, hidden_dim),
             nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, num_classes),
+            nn.Dropout(p_drop),
+            nn.Linear(hidden_dim, num_classes)
         )
-        # He init
+        self._init_weights()
+
+    def _init_weights(self):
+        # Kaiming-normal is fine with GELU + LayerNorm
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
+                nn.init.zeros_(m.bias)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Forward pass through auxiliary classifier.
-
-        Args:
-            x (Tensor): shape (B, D) or (B, T, D)
-
-        Returns:
-            logits (Tensor): shape (B, C) or (B * T, C)
+        x : (B, D) or (B, T, D) – flatten if needed.
         """
         if x.dim() == 3:
             B, T, D = x.shape
-            x = x.view(B * T, D)  # Flatten chunks for classification
-
-        return self.aux_classifier(x)  # (B, C)
+            x = x.reshape(B * T, D)
+        return self.net(x)
