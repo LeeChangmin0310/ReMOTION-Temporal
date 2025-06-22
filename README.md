@@ -19,6 +19,28 @@
 
 ---
 
+## TODO
+
+- [x] **Training code**  
+  Full training pipeline uploaded.
+
+- [x] **Inference code**  
+  Inference script uploaded.
+
+- [x] **README cleanup**  
+  README streamlined to cover installation and basic usage only.
+
+- [ ] **Citation information**  
+  Update DOI and BibTeX entry after the Sensors article is officially published.
+
+- [ ] **Pre-trained weights**  
+  Model checkpoints are still being organized; they will be uploaded to `saved_models/` once ready.
+
+- [ ] **Experiment scripts**  
+  Add reproducibility scripts for all experiments reported in the paper (ablations, hyper-parameter search, etc.).
+
+---
+
 ## 📝 Overview
 
 End-to-end **phase-aware** emotion recognition on top of [rPPG-Toolbox](https://github.com/ubicomplab/rPPG-Toolbox).
