@@ -30,7 +30,7 @@
 - [x] **README cleanup**  
   README streamlined to cover installation and basic usage only.
 
-- [ ] **Citation information**  
+- [x] **Citation information**  
   Update DOI and BibTeX entry after the Sensors article is officially published.
 
 - [ ] **Pre-trained weights**  
