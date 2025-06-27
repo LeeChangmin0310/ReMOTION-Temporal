@@ -111,17 +111,17 @@ If you use Windows or other operating systems, consider using [Windows Subsystem
 ## 📁 How to Cite
 
 ```bibtex
-@Article{s3658084,
+@Article{s25133995,
   AUTHOR = {Lee, Changmin and Lee, Hyunwoo and Whang, Mincheol},
-  TITLE  = {Emotion Recognition from rPPG via Physiologically-Inspired Temporal Encoding and Attention-based Curriculum Learning},
+  TITLE = {Emotion Recognition from rPPG via Physiologically-Inspired Temporal Encoding and Attention-based Curriculum Learning},
   JOURNAL = {Sensors},
   VOLUME = {25},
   YEAR = {2025},
-  NUMBER = {},
-  ARTICLE-NUMBER = {},
-  URL = {},
+  NUMBER = {13},
+  ARTICLE-NUMBER = {3995},
+  URL = {https://www.mdpi.com/1424-8220/25/13/3995},
   ISSN = {1424-8220},
-  DOI = {}
+  DOI = {10.3390/s25133995}
 }
 ```
 
